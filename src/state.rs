@@ -182,6 +182,37 @@ impl State {
                 let state = event.state();
 
                 let pointer = self.seat.get_pointer().unwrap();
+
+                // Focus window and update pointer focus under cursor on click
+                if state == ButtonState::Pressed {
+                    let pos = pointer.current_location();
+                    let under = self.space.element_under(pos);
+                    let focus = under.as_ref().and_then(|(win, local_pos)| {
+                        win.surface_under(
+                            local_pos.to_f64(),
+                            WindowSurfaceType::ALL,
+                        )
+                        .map(|(surface, surface_local_pos)| {
+                            (surface, surface_local_pos.to_f64())
+                        })
+                    });
+                    let surface = under.and_then(|(win, _)| win.wl_surface().map(|c| c.into_owned()));
+
+                    pointer.motion(
+                        self,
+                        focus,
+                        &smithay::input::pointer::MotionEvent {
+                            location: pos,
+                            time,
+                            serial,
+                        },
+                    );
+
+                    if let Some(surface) = surface {
+                        self.set_keyboard_focus(Some(surface));
+                    }
+                }
+
                 pointer.button(
                     self,
                     &smithay::input::pointer::ButtonEvent {
@@ -192,16 +223,6 @@ impl State {
                     },
                 );
                 pointer.frame(self);
-
-                // Focus window on click
-                if state == ButtonState::Pressed {
-                    let pos = pointer.current_location();
-                    let surface = self.space.element_under(pos)
-                        .and_then(|(win, _)| win.wl_surface().map(|c| c.into_owned()));
-                    if let Some(surface) = surface {
-                        self.set_keyboard_focus(Some(surface));
-                    }
-                }
             }
             _ => {}
         }
@@ -348,7 +369,7 @@ impl State {
         keysym: Keysym,
     ) -> FilterResult<()> {
         if key_state == KeyState::Pressed {
-            if modifiers.logo {
+            if modifiers.logo || modifiers.alt {
                 if modifiers.shift {
                     match keysym.raw() {
                         keysyms::KEY_Left | keysyms::KEY_h => {

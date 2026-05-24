@@ -68,7 +68,7 @@ def ppm_to_png(ppm_path, png_path):
 
 def get_terminal_cmd():
     import shutil
-    for term in ["foot", "alacritty", "kitty", "xterm"]:
+    for term in ["alacritty", "foot", "kitty", "xterm"]:
         if shutil.which(term):
             return [term]
     return ["alacritty"]
