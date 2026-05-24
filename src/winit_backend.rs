@@ -22,6 +22,12 @@ smithay::backend::renderer::element::render_elements! {
 }
 
 pub fn detect_host_transform() -> Transform {
+    if let Ok(val) = std::env::var("HIER_HOST_TRANSFORM") {
+        return match val.as_str() {
+            "180" | "Flipped180" => Transform::Normal,
+            _ => Transform::Flipped180,
+        };
+    }
     let pid = std::process::id() as i64;
     
     // 1. Get workspace_id of our window
@@ -273,7 +279,7 @@ pub fn run_winit_compositor() -> Result<(), Box<dyn std::error::Error>> {
         match event {
             WinitEvent::Resized { size, .. } => {
                 state.layout_engine.resize_viewport(size.w as f32, size.h as f32);
-                let current_transform = detect_host_transform();
+                let current_transform = state.output.current_transform();
                 state.output.change_current_state(
                     Some(OutputMode {
                         size: (size.w as i32, size.h as i32).into(),
@@ -383,8 +389,20 @@ pub fn run_winit_compositor() -> Result<(), Box<dyn std::error::Error>> {
                         smithay::backend::renderer::Color32F::from([0.08f32, 0.08f32, 0.08f32, 1.0f32]),
                     ).expect("failed to render output")
                 };
-
                 backend.submit(damage.damage.map(|v| v.as_slice())).unwrap();
+
+                let time = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default();
+
+                state.space.elements().for_each(|window| {
+                    window.send_frame(
+                        &state.output,
+                        time,
+                        Some(Duration::ZERO),
+                        |_, _| Some(state.output.clone()),
+                    );
+                });
             }
             WinitEvent::CloseRequested => {
                 state.running = false;

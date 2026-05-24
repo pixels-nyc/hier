@@ -19,6 +19,7 @@ import json
 import re
 import struct
 import zlib
+import threading
 
 def save_png(width, height, rgb_bytes, output_path):
     png = bytearray([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
@@ -127,10 +128,33 @@ def parse_ppm_border(path: str) -> bool:
         print(f"❌ Error parsing PPM: {e}")
         return False
 
-def spawn_compositor(parent_display=None):
+def get_active_output_transform() -> str:
+    try:
+        res_ws = subprocess.check_output(["niri", "msg", "--json", "workspaces"]).decode()
+        workspaces = json.loads(res_ws)
+        active_output = None
+        for ws in workspaces:
+            if ws.get("is_focused") or ws.get("is_active"):
+                active_output = ws.get("output")
+                if ws.get("is_focused"):
+                    break
+        if not active_output:
+            return "Normal"
+        res_outs = subprocess.check_output(["niri", "msg", "--json", "outputs"]).decode()
+        outputs = json.loads(res_outs)
+        output = outputs.get(active_output)
+        if output:
+            return output["logical"].get("transform", "Normal")
+    except Exception:
+        pass
+    return "Normal"
+
+def spawn_compositor(parent_display=None, host_transform="Normal"):
     env = os.environ.copy()
     if parent_display:
         env["WAYLAND_DISPLAY"] = parent_display
+    env["HIER_HOST_TRANSFORM"] = host_transform
+    env["LIBGL_ALWAYS_SOFTWARE"] = "1"
     
     # Start compositor process
     proc = subprocess.Popen(
@@ -145,7 +169,7 @@ def spawn_compositor(parent_display=None):
     start_time = time.time()
     lines_read = []
     while True:
-        if time.time() - start_time > 10.0:
+        if time.time() - start_time > 15.0:
             print("❌ Error: Timeout waiting for compositor initialization.")
             proc.terminate()
             sys.exit(1)
@@ -165,7 +189,29 @@ def spawn_compositor(parent_display=None):
             display_name = match.group(1)
             break
             
-    os.set_blocking(proc.stdout.fileno(), False)
+    # Drain output in background thread to avoid pipe capacity deadlock / Rust println panic
+    def drain():
+        log_name = f"/tmp/hier-demo-{'nest1' if parent_display else 'nest0'}.log"
+        try:
+            with open(log_name, "w", buffering=1) as f:
+                for l in lines_read:
+                    f.write(l)
+                f.flush()
+                while True:
+                    line = proc.stdout.readline()
+                    if not line:
+                        if proc.poll() is not None:
+                            break
+                        time.sleep(0.1)
+                        continue
+                    f.write(line)
+                    f.flush()
+        except Exception:
+            pass
+            
+    t = threading.Thread(target=drain, daemon=True)
+    t.start()
+    
     return proc, display_name, lines_read
 
 def main():
@@ -176,7 +222,9 @@ def main():
     # 1. Start Nest 0 (Root nested compositor)
     parent_wayland = os.environ.get("WAYLAND_DISPLAY", "wayland-1")
     print(f"[*] Spawning Nest 0 root compositor under parent: {parent_wayland}...")
-    comp0, display0, logs0 = spawn_compositor()
+    host_transform = get_active_output_transform()
+    print(f"[*] Detected active host monitor transform: {host_transform}")
+    comp0, display0, logs0 = spawn_compositor(host_transform=host_transform)
     print(f"✅ Nest 0 successfully initialized display: {display0}")
     socket_n0 = f"/tmp/hier-ctrl-{display0}.sock"
     time.sleep(2.0)
