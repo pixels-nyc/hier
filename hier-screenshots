@@ -1,0 +1,367 @@
+#!/usr/bin/env python3
+import os
+import sys
+import time
+import socket
+import subprocess
+import shutil
+import json
+import re
+import threading
+
+def get_active_output_transform() -> str:
+    try:
+        # Get workspaces to find focused one
+        res_ws = subprocess.check_output(["niri", "msg", "--json", "workspaces"]).decode()
+        workspaces = json.loads(res_ws)
+        active_output = None
+        for ws in workspaces:
+            if ws.get("is_focused") or ws.get("is_active"):
+                active_output = ws.get("output")
+                # If it's focused, prioritize it
+                if ws.get("is_focused"):
+                    break
+        if not active_output:
+            return "Normal"
+        # Get outputs to find its transform
+        res_outs = subprocess.check_output(["niri", "msg", "--json", "outputs"]).decode()
+        outputs = json.loads(res_outs)
+        output = outputs.get(active_output)
+        if output:
+            return output["logical"].get("transform", "Normal")
+    except Exception as e:
+        print(f"Warning detecting active output transform: {e}")
+    return "Normal"
+
+def send_cmd(socket_path: str, cmd: str) -> str:
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(5.0)  # slightly larger timeout
+        s.connect(socket_path)
+        s.sendall((cmd + "\n").encode())
+        res = s.recv(16384).decode()
+        s.close()
+        return res
+    except Exception as e:
+        return f"error: {e}"
+
+def get_terminal_cmd():
+    for term in ["foot", "alacritty", "kitty", "xterm"]:
+        if shutil.which(term):
+            return term
+    return "alacritty"
+
+def spawn_compositor(parent_display=None, fullscreen=False, host_transform="Normal"):
+    env = os.environ.copy()
+    if parent_display:
+        env["WAYLAND_DISPLAY"] = parent_display
+    if fullscreen:
+        env["HIER_FULLSCREEN"] = "1"
+    
+    env["HIER_HOST_TRANSFORM"] = host_transform
+    env["LIBGL_ALWAYS_SOFTWARE"] = "1"  # Force software rendering for nesting stability
+
+    proc = subprocess.Popen(
+        ["./target/debug/hier"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        env=env,
+        text=True,
+        cwd=os.getcwd()
+    )
+    
+    display_name = None
+    start_time = time.time()
+    lines_read = []
+    while True:
+        if time.time() - start_time > 15.0:
+            print("❌ Error: Timeout waiting for compositor initialization.")
+            proc.terminate()
+            sys.exit(1)
+            
+        line = proc.stdout.readline()
+        if not line:
+            ret = proc.poll()
+            if ret is not None:
+                print(f"❌ Error: Compositor exited early with code {ret}")
+                sys.exit(1)
+            time.sleep(0.05)
+            continue
+            
+        lines_read.append(line)
+        match = re.search(r"WAYLAND_DISPLAY=(wayland-\d+)", line)
+        if match:
+            display_name = match.group(1)
+            break
+            
+    # Start background thread to drain output to log file and prevent deadlock
+    def drain():
+        log_name = f"/tmp/hier-{'nest0' if fullscreen else 'nest1'}.log"
+        try:
+            with open(log_name, "w", buffering=1) as f:
+                for l in lines_read:
+                    f.write(l)
+                f.flush()
+                while True:
+                    line = proc.stdout.readline()
+                    if not line:
+                        if proc.poll() is not None:
+                            break
+                        time.sleep(0.1)
+                        continue
+                    f.write(line)
+                    f.flush()
+        except Exception as e:
+            print(f"Error in drain thread for {log_name}: {e}")
+                
+    t = threading.Thread(target=drain, daemon=True)
+    t.start()
+    
+    return proc, display_name
+    
+def focus_and_center_window(nest0_pid):
+    print("[*] Binding and focusing Nest 0 window using Niri navigation...")
+    start = time.time()
+    while time.time() - start < 15.0:
+        try:
+            # 1. Query windows to find our window
+            res_wins = subprocess.check_output(["niri", "msg", "--json", "windows"]).decode()
+            wins = json.loads(res_wins)
+            
+            our_win = None
+            for w in wins:
+                if w.get("pid") == nest0_pid or w.get("title") == "Smithay":
+                    our_win = w
+                    break
+                    
+            if not our_win:
+                time.sleep(0.5)
+                continue
+                
+            win_id = our_win["id"]
+            workspace_id = our_win["workspace_id"]
+            
+            # 2. Focus the window directly using Niri msg action focus-window --id
+            print(f"[*] Focusing window ID {win_id} via Niri IPC...")
+            subprocess.run(["niri", "msg", "action", "focus-window", "--id", str(win_id)], check=True)
+            time.sleep(0.5)
+            
+            # 3. Center the column on screen
+            print("[*] Centering window column on host compositor...")
+            subprocess.run(["niri", "msg", "action", "center-column"], check=False)
+            time.sleep(0.5)
+            
+            # 4. Query workspaces to map workspace_id to output name
+            res_ws = subprocess.check_output(["niri", "msg", "--json", "workspaces"]).decode()
+            workspaces = json.loads(res_ws)
+            
+            target_ws = None
+            for ws in workspaces:
+                if ws["id"] == workspace_id:
+                    target_ws = ws
+                    break
+                    
+            if not target_ws:
+                time.sleep(0.5)
+                continue
+                
+            output_name = target_ws["output"]
+            
+            # 5. Query outputs for size and logical coordinate offset
+            res_outs = subprocess.check_output(["niri", "msg", "--json", "outputs"]).decode()
+            outputs = json.loads(res_outs)
+            
+            output = outputs.get(output_name)
+            if not output:
+                time.sleep(0.5)
+                continue
+                
+            logical = output["logical"]
+            ox = int(logical["x"])
+            oy = int(logical["y"])
+            ow = int(logical["width"])
+            oh = int(logical["height"])
+            
+            # Centered window geometry calculation
+            # Query windows again to ensure size is up to date after focus / center
+            res_wins = subprocess.check_output(["niri", "msg", "--json", "windows"]).decode()
+            wins = json.loads(res_wins)
+            for w in wins:
+                if w.get("id") == win_id:
+                    our_win = w
+                    break
+            win_w, win_h = our_win["layout"]["window_size"]
+            
+            if win_w >= ow - 10 and win_h >= oh - 10:
+                wx = ox
+                wy = oy
+                ww = ow
+                wh = oh
+            else:
+                wx = ox + (ow - win_w) // 2
+                wy = oy + (oh - win_h) // 2
+                ww = win_w
+                wh = win_h
+                
+            print(f"✅ Bound successfully to screen region ({wx}, {wy}) size {ww}x{wh} on output {output_name}")
+            return wx, wy, ww, wh, output_name
+        except Exception as e:
+            print(f"  Warning: {e}")
+            time.sleep(0.5)
+            
+    print("⚠️ Nest 0 window navigation failed. Using default values.")
+    return 0, 0, 1920, 1080, "HDMI-A-1"
+
+def parse_window_rects(layout_str):
+    rects = {}
+    for line in layout_str.strip().split("\n"):
+        if not line or line.startswith("error:"):
+            continue
+        parts = line.split(":", 5)
+        if len(parts) < 6:
+            continue
+        try:
+            win_id = int(parts[2])
+            rect_str = parts[4]
+            x, y, w, h = map(int, rect_str.split(","))
+            rects[win_id] = (x, y, w, h)
+        except ValueError:
+            continue
+    return rects
+
+def main():
+    captures_dir = "/home/super/.gemini/antigravity/brain/f93f86a1-b0d6-49ce-b82f-d76376c60ee0/captures"
+    os.makedirs(captures_dir, exist_ok=True)
+    
+    print("[*] Rebuilding compositor...")
+    subprocess.run(["cargo", "build"], check=True)
+
+    # Detect the active output transform first so we can pass it to Nest 0
+    host_transform = get_active_output_transform()
+    print(f"[*] Detected active host monitor transform: {host_transform}")
+
+    print("[*] Spawning Nest 0 (Root nested compositor) in fullscreen...")
+    comp0, display0 = spawn_compositor(fullscreen=True, host_transform=host_transform)
+    print(f"✅ Nest 0 started on display: {display0}")
+    socket0 = f"/tmp/hier-ctrl-{display0}.sock"
+    time.sleep(2.0)
+
+    # Perform Niri navigation to bind, focus, and center the window on screen
+    ox, oy, ow, oh, out_name = focus_and_center_window(comp0.pid)
+
+    # Spawn Nest 1 inside Nest 0
+    print(f"[*] Spawning Nest 1 (Nested child compositor) inside Nest 0...")
+    comp1, display1 = spawn_compositor(parent_display=display0, fullscreen=False, host_transform="Normal")
+    print(f"✅ Nest 1 started on display: {display1}")
+    socket1 = f"/tmp/hier-ctrl-{display1}.sock"
+    time.sleep(3.0)
+
+    term = get_terminal_cmd()
+    print(f"[*] Spawning terminal clients ({term}) inside Nest 1...")
+    
+    env_clients = os.environ.copy()
+    env_clients["WAYLAND_DISPLAY"] = display1
+    
+    cmd_a = [
+        term,
+        "sh", "-c",
+        "echo -e '\\033[1;36m=== HIER WAYLAND COMPOSITOR ARCHITECTURE ===\\033[0m'; echo; head -n 30 README.md; exec sh"
+    ]
+    
+    cmd_b = [
+        term,
+        "sh", "-c",
+        "echo -e '\\033[1;32m=== GIT COMMIT LOG ===\\033[0m'; git log -n 5 --oneline; echo; echo -e '\\033[1;35m=== CARGO.TOML CONFIG ===\\033[0m'; cat Cargo.toml; exec sh"
+    ]
+
+    cmd_c = [
+        term,
+        "sh", "-c",
+        "echo -e '\\033[1;33m=== COMPILER INTEGRATION CHECK ===\\033[0m'; echo 'Running cargo check inside nested terminal...'; cargo check; exec sh"
+    ]
+
+    p_a = subprocess.Popen(cmd_a, env=env_clients)
+    time.sleep(2.0)
+    p_b = subprocess.Popen(cmd_b, env=env_clients)
+    time.sleep(2.0)
+    p_c = subprocess.Popen(cmd_c, env=env_clients)
+    time.sleep(4.0)
+
+    # Query layouts
+    layout_n0 = send_cmd(socket0, "get_layout_compact")
+    print(f"[*] Nest 0 Layout:\n{layout_n0}")
+    if "error:" in layout_n0:
+        print("❌ Nest 0 failed or timed out. Printing /tmp/hier-nest0.log:")
+        try:
+            with open("/tmp/hier-nest0.log", "r") as f:
+                print(f.read())
+        except Exception as e:
+            print(f"Could not read Nest 0 log: {e}")
+            
+    rects_n0 = parse_window_rects(layout_n0)
+    
+    n1_rect = rects_n0.get(1, (30, 20, ow - 60, oh - 40))
+    x0, y0, w0, h0 = n1_rect
+    print(f"[*] Nest 1 size in Nest 0: ({x0}, {y0}) size {w0}x{h0}")
+
+    layout_n1 = send_cmd(socket1, "get_layout_compact")
+    print(f"[*] Nest 1 Layout:\n{layout_n1}")
+    if "error:" in layout_n1:
+        print("❌ Nest 1 failed or timed out. Printing /tmp/hier-nest1.log:")
+        try:
+            with open("/tmp/hier-nest1.log", "r") as f:
+                print(f.read())
+        except Exception as e:
+            print(f"Could not read Nest 1 log: {e}")
+            
+    rects_n1 = parse_window_rects(layout_n1)
+
+    # 1. capture_wayland-2_win_1.png
+    rx = ox + x0
+    ry = oy + y0
+    print(f"[*] Capturing Nest 1 window: grim -g \"{rx},{ry} {w0}x{h0}\"")
+    img_n1 = os.path.join(captures_dir, "capture_wayland-2_win_1.png")
+    subprocess.run(["grim", "-g", f"{rx},{ry} {w0}x{h0}", img_n1], check=True)
+
+    # 2. Capture individual clients
+    for win_id, name in [(1, "capture_wayland-3_win_1.png"), 
+                         (2, "capture_wayland-3_win_2.png"), 
+                         (3, "capture_wayland-3_win_3.png")]:
+        rect = rects_n1.get(win_id)
+        if rect:
+            x1, y1, w1, h1 = rect
+            cx = ox + x0 + x1
+            cy = oy + y0 + y1
+            img_client = os.path.join(captures_dir, name)
+            print(f"[*] Capturing Client {win_id}: grim -g \"{cx},{cy} {w1}x{h1}\" -> {name}")
+            subprocess.run(["grim", "-g", f"{cx},{cy} {w1}x{h1}", img_client], check=True)
+            
+            if win_id == 2:
+                shutil.copy(img_client, os.path.join(captures_dir, "capture_wayland-2_win_2.png"))
+            elif win_id == 3:
+                shutil.copy(img_client, os.path.join(captures_dir, "capture_wayland-2_win_3.png"))
+        else:
+            print(f"⚠️ Warning: Client window {win_id} not found in Nest 1 layout.")
+
+    # 3. Capture demo_highlight.png
+    print("[*] Highlighting Window 1 in Nest 1...")
+    send_cmd(socket1, "highlight_window 1 blue")
+    time.sleep(1.5)
+    
+    img_highlight = os.path.join(captures_dir, "demo_highlight.png")
+    print(f"[*] Capturing highlight screenshot: grim -g \"{rx},{ry} {w0}x{h0}\"")
+    subprocess.run(["grim", "-g", f"{rx},{ry} {w0}x{h0}", img_highlight], check=True)
+    
+    send_cmd(socket1, "clear_highlight")
+    time.sleep(0.5)
+
+    print("[*] Cleaning up compositor and client processes...")
+    p_a.terminate()
+    p_b.terminate()
+    p_c.terminate()
+    comp1.terminate()
+    comp0.terminate()
+    print("🎉 Real graphical screenshots captured successfully!")
+
+if __name__ == "__main__":
+    main()
