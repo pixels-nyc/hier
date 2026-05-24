@@ -1202,10 +1202,18 @@ impl State {
                         })
                     });
 
+                    let pid = win.toplevel().and_then(|t| {
+                        use smithay::reexports::wayland_server::Resource;
+                        t.wl_surface().client().and_then(|c| {
+                            c.get_credentials(&self.display_handle).ok().map(|creds| creds.pid)
+                        })
+                    });
+
                     serde_json::json!({
                         "id": id.0,
                         "title": title,
-                        "app_id": app_id
+                        "app_id": app_id,
+                        "pid": pid
                     })
                 }).collect();
 

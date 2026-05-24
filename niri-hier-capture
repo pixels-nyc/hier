@@ -1,0 +1,482 @@
+#!/usr/bin/env python3
+import os
+import sys
+import json
+import socket
+import re
+import subprocess
+import argparse
+import time
+
+def get_inode_to_socket_map():
+    """Parses /proc/net/unix to map socket inodes to wayland displays."""
+    inode_to_socket = {}
+    try:
+        with open("/proc/net/unix", "r") as f:
+            lines = f.readlines()
+    except Exception as e:
+        print(f"Error reading /proc/net/unix: {e}")
+        return inode_to_socket
+
+    for line in lines[1:]:
+        parts = line.strip().split()
+        if len(parts) >= 8:
+            inode = parts[6]
+            path = parts[7]
+            match = re.search(r"wayland-\d+$", path)
+            if match:
+                inode_to_socket[inode] = match.group(0)
+    return inode_to_socket
+
+def get_process_info(inode_to_socket):
+    """Scans /proc to extract process details, parent displays, and owned displays."""
+    processes = {}
+    pids = [d for d in os.listdir("/proc") if d.isdigit()]
+    
+    for pid_str in pids:
+        pid = int(pid_str)
+        proc_dir = f"/proc/{pid}"
+        try:
+            with open(f"{proc_dir}/comm", "r") as f:
+                name = f.read().strip()
+        except IOError:
+            continue
+
+        if name in ("systemd", "dbus-daemon", "dbus-broker", "pipewire", "wireplumber"):
+            continue
+
+        parent_display = None
+        try:
+            with open(f"{proc_dir}/environ", "rb") as f:
+                environ_bytes = f.read()
+            environ_strs = environ_bytes.decode("utf-8", errors="ignore").split("\x00")
+            for entry in environ_strs:
+                if entry.startswith("WAYLAND_DISPLAY="):
+                    parent_display = entry.split("=", 1)[1]
+                    break
+        except Exception:
+            pass
+
+        owned_displays = []
+        try:
+            fd_dir = f"{proc_dir}/fd"
+            for fd in os.listdir(fd_dir):
+                fd_path = f"{fd_dir}/{fd}"
+                try:
+                    target = os.readlink(fd_path)
+                    match = re.match(r"socket:\[(\d+)\]", target)
+                    if match:
+                        inode = match.group(1)
+                        if inode in inode_to_socket:
+                            display = inode_to_socket[inode]
+                            if display not in owned_displays:
+                                owned_displays.append(display)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        processes[pid] = {
+            "pid": pid,
+            "name": name,
+            "parent_display": parent_display,
+            "owned_displays": owned_displays
+        }
+    return processes
+
+def build_hierarchy():
+    inode_map = get_inode_to_socket_map()
+    procs = get_process_info(inode_map)
+    
+    display_owners = {}
+    for pid, info in procs.items():
+        for d in info["owned_displays"]:
+            display_owners[d] = pid
+
+    # Determine host display (typically wayland-1 or first socket without owner)
+    all_displays = set(display_owners.keys())
+    host_display = os.environ.get("WAYLAND_DISPLAY", "wayland-1")
+    
+    return procs, display_owners, host_display
+
+def send_cmd(socket_path: str, cmd: str) -> str:
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(2.0)
+        s.connect(socket_path)
+        s.sendall((cmd + "\n").encode())
+        res = ""
+        while True:
+            try:
+                chunk = s.recv(4096).decode()
+                if not chunk:
+                    break
+                res += chunk
+            except socket.timeout:
+                break
+        s.close()
+        return res
+    except Exception as e:
+        return f"error: {e}"
+
+def parse_window_rects(layout_str):
+    rects = {}
+    for line in layout_str.strip().split("\n"):
+        if not line or line.startswith("error:"):
+            continue
+        parts = line.split(":", 5)
+        if len(parts) < 6:
+            continue
+        try:
+            win_id = int(parts[2])
+            rect_str = parts[4]
+            x, y, w, h = map(int, rect_str.split(","))
+            rects[win_id] = (x, y, w, h)
+        except ValueError:
+            continue
+    return rects
+
+def focus_window_by_id(socket_path, target_win_id):
+    """Dynamically moves focus to target_win_id in a nested compositor."""
+    for attempt in range(10):
+        layout = send_cmd(socket_path, "get_layout_compact")
+        target_col = None
+        focused_col = None
+        
+        for line in layout.strip().split("\n"):
+            if not line or line.startswith("error:"):
+                continue
+            parts = line.split(":", 5)
+            if len(parts) < 4:
+                continue
+            try:
+                col_idx = int(parts[1])
+                win_id = int(parts[2])
+                is_focused = parts[3].lower() == "true"
+                
+                if win_id == target_win_id:
+                    target_col = col_idx
+                if is_focused:
+                    focused_col = col_idx
+            except ValueError:
+                continue
+                
+        if target_col is None:
+            return False
+            
+        lines = layout.strip().split("\n")
+        windows_in_target_col = []
+        focused_win_in_target_col_id = None
+        for line in lines:
+            if not line or line.startswith("error:"):
+                continue
+            parts = line.split(":", 5)
+            if len(parts) < 4:
+                continue
+            try:
+                col_idx = int(parts[1])
+                win_id = int(parts[2])
+                is_focused = parts[3].lower() == "true"
+                if col_idx == target_col:
+                    windows_in_target_col.append(win_id)
+                    if is_focused:
+                        focused_win_in_target_col_id = win_id
+            except ValueError:
+                continue
+                
+        if focused_col is None:
+            time.sleep(0.1)
+            continue
+            
+        if target_col != focused_col:
+            if target_col < focused_col:
+                send_cmd(socket_path, "action focus-left")
+            else:
+                send_cmd(socket_path, "action focus-right")
+            time.sleep(0.3)
+            continue
+            
+        if focused_win_in_target_col_id == target_win_id:
+            return True
+            
+        try:
+            target_idx = windows_in_target_col.index(target_win_id)
+            focused_idx = windows_in_target_col.index(focused_win_in_target_col_id)
+            if target_idx < focused_idx:
+                send_cmd(socket_path, "action focus-up")
+            else:
+                send_cmd(socket_path, "action focus-down")
+        except ValueError:
+            return False
+            
+        time.sleep(0.3)
+    return False
+
+def get_niri_window_geometry(win_id):
+    """Calculates absolute screen coordinates for a Niri window (optionally centers first)."""
+    # 1. Query workspaces to find active one or window's workspace
+    res_wins = subprocess.check_output(["niri", "msg", "--json", "windows"]).decode()
+    wins = json.loads(res_wins)
+    
+    target_win = None
+    for w in wins:
+        if w.get("id") == win_id:
+            target_win = w
+            break
+            
+    if not target_win:
+        raise ValueError(f"Window ID {win_id} not found in Niri")
+        
+    workspace_id = target_win["workspace_id"]
+    win_w, win_h = target_win["layout"]["window_size"]
+    
+    # 2. Query workspaces to find output name
+    res_ws = subprocess.check_output(["niri", "msg", "--json", "workspaces"]).decode()
+    workspaces = json.loads(res_ws)
+    
+    target_ws = None
+    for ws in workspaces:
+        if ws["id"] == workspace_id:
+            target_ws = ws
+            break
+            
+    if not target_ws:
+        raise ValueError(f"Workspace {workspace_id} not found for Niri window")
+        
+    output_name = target_ws["output"]
+    
+    # 3. Query outputs for logical coordinate offset
+    res_outs = subprocess.check_output(["niri", "msg", "--json", "outputs"]).decode()
+    outputs = json.loads(res_outs)
+    
+    output = outputs.get(output_name)
+    if not output:
+        raise ValueError(f"Output {output_name} not found in Niri configuration")
+        
+    logical = output["logical"]
+    ox, oy = int(logical["x"]), int(logical["y"])
+    ow, oh = int(logical["width"]), int(logical["height"])
+    
+    # Calculate centered position on that monitor
+    if win_w >= ow - 10 and win_h >= oh - 10:
+        wx, wy = ox, oy
+        ww, wh = ow, oh
+    else:
+        wx = ox + (ow - win_w) // 2
+        wy = oy + (oh - win_h) // 2
+        ww, wh = win_w, win_h
+        
+    return wx, wy, ww, wh
+
+def resolve_absolute_rect(display, win_id, procs, display_owners, host_display, focus=True):
+    """Recursively resolves absolute screen coordinates for a window on a given display."""
+    if display == host_display:
+        if focus:
+            print(f"[*] Focusing Window {win_id} on host Niri compositor...")
+            subprocess.run(["niri", "msg", "action", "focus-window", "--id", str(win_id)], check=False)
+            time.sleep(0.3)
+            subprocess.run(["niri", "msg", "action", "center-column"], check=False)
+            time.sleep(0.3)
+        return get_niri_window_geometry(win_id)
+        
+    # Nested display case
+    socket_path = f"/tmp/hier-ctrl-{display}.sock"
+    if not os.path.exists(socket_path):
+        raise FileNotFoundError(f"Control socket for display {display} not found at {socket_path}")
+        
+    if focus:
+        print(f"[*] Focusing Window {win_id} on nested display {display}...")
+        focused = focus_window_by_id(socket_path, win_id)
+        if not focused:
+            print(f"⚠️ Warning: Failed to focus window {win_id} on display {display}")
+            
+    # Get local coordinates
+    layout_str = send_cmd(socket_path, "get_layout_compact")
+    rects = parse_window_rects(layout_str)
+    rect = rects.get(win_id)
+    if not rect:
+        raise ValueError(f"Window ID {win_id} not found in layout for display {display}")
+    lx, ly, lw, lh = rect
+    
+    # Find owner process PID of this nested display
+    owner_pid = display_owners.get(display)
+    if not owner_pid:
+        raise ValueError(f"Could not resolve owner process for display {display}")
+        
+    owner_info = procs.get(owner_pid)
+    parent_disp = owner_info["parent_display"] if owner_info else None
+    if not parent_disp:
+        parent_disp = host_display  # default fallback
+        
+    print(f"[*] Display {display} is owned by PID {owner_pid} on parent display {parent_disp}")
+    
+    # Find window representation of owner_pid on parent display
+    parent_win_id = None
+    if parent_disp == host_display:
+        # Query Niri windows
+        res_wins = subprocess.check_output(["niri", "msg", "--json", "windows"]).decode()
+        wins = json.loads(res_wins)
+        for w in wins:
+            if w.get("pid") == owner_pid or w.get("title") == "Smithay":
+                parent_win_id = w["id"]
+                break
+    else:
+        # Query nested parent windows
+        parent_socket = f"/tmp/hier-ctrl-{parent_disp}.sock"
+        if os.path.exists(parent_socket):
+            parent_wins_str = send_cmd(parent_socket, "get_windows")
+            try:
+                parent_wins = json.loads(parent_wins_str)
+                for w in parent_wins:
+                    if w.get("pid") == owner_pid or w.get("title") == "Smithay":
+                        parent_win_id = w["id"]
+                        break
+            except Exception:
+                pass
+                
+    if parent_win_id is None:
+        raise ValueError(f"Could not locate parent compositor window representing PID {owner_pid} on display {parent_disp}")
+        
+    # Recurse to find parent absolute coordinates
+    px, py, pw, ph = resolve_absolute_rect(parent_disp, parent_win_id, procs, display_owners, host_display, focus=focus)
+    
+    return px + lx, py + ly, lw, lh
+
+def list_all_windows(procs, display_owners, host_display):
+    print("==================================================")
+    print("      ACTIVE DISPLAYS & WINDOWS LISTING           ")
+    print("==================================================")
+    
+    # 1. Host Niri windows
+    print(f"\n[Host Display: {host_display}] (Niri)")
+    try:
+        res_wins = subprocess.check_output(["niri", "msg", "--json", "windows"]).decode()
+        wins = json.loads(res_wins)
+        for w in wins:
+            geom = ""
+            try:
+                gx, gy, gw, gh = get_niri_window_geometry(w["id"])
+                geom = f" (screen rect: {gx},{gy} {gw}x{gh})"
+            except Exception:
+                pass
+            print(f"  ├── Window ID {w['id']}: \"{w['title']}\" [app_id: {w['app_id']}, pid: {w['pid']}]{geom}")
+    except Exception as e:
+        print(f"  Error reading Niri windows: {e}")
+        
+    # 2. Nested displays
+    for disp in sorted(display_owners.keys()):
+        owner_pid = display_owners[disp]
+        owner_name = procs[owner_pid]["name"] if owner_pid in procs else "Unknown"
+        print(f"\n[Nested Display: {disp}] (owned by PID {owner_pid}: {owner_name})")
+        socket_path = f"/tmp/hier-ctrl-{disp}.sock"
+        if not os.path.exists(socket_path):
+            print("  Socket not found.")
+            continue
+            
+        # Get windows
+        wins_str = send_cmd(socket_path, "get_windows")
+        layout_str = send_cmd(socket_path, "get_layout_compact")
+        rects = parse_window_rects(layout_str)
+        
+        try:
+            wins = json.loads(wins_str)
+            for w in wins:
+                win_id = w["id"]
+                rect = rects.get(win_id, (0, 0, 0, 0))
+                rect_str = f"{rect[0]},{rect[1]} {rect[2]}x{rect[3]}"
+                
+                # Try to compute absolute coordinate
+                abs_rect_str = ""
+                try:
+                    ax, ay, aw, ah = resolve_absolute_rect(disp, win_id, procs, display_owners, host_display, focus=False)
+                    abs_rect_str = f" (absolute: {ax},{ay} {aw}x{ah})"
+                except Exception:
+                    pass
+                    
+                print(f"  ├── Window ID {win_id}: \"{w['title']}\" [app_id: {w.get('app_id')}, pid: {w.get('pid')}] (local: {rect_str}){abs_rect_str}")
+        except Exception as e:
+            print(f"  Error parsing windows: {e}. Output was: {wins_str}")
+
+def main():
+    procs, display_owners, host_display = build_hierarchy()
+    
+    parser = argparse.ArgumentParser(
+        description="Generalized recursive screenshot capture for host Niri and nested displays."
+    )
+    parser.add_argument("--list", "-l", action="store_true", help="List all windows and displays.")
+    parser.add_argument("--display", "-d", help="Display name containing the window (e.g. wayland-3). Defaults to host display.")
+    parser.add_argument("--window", "-w", type=int, help="Window ID to capture.")
+    parser.add_argument("--output", "-o", help="Output PNG path (defaults to capture_{display}_win_{id}.png)")
+    parser.add_argument("--all", "-a", action="store_true", help="Capture all windows across all displays.")
+    parser.add_argument("--dir", default=".", help="Directory to save captures in --all mode.")
+    parser.add_argument("--no-focus", action="store_true", help="Do not focus the window before capturing.")
+    
+    args = parser.parse_args()
+    
+    if args.list:
+        list_all_windows(procs, display_owners, host_display)
+        sys.exit(0)
+        
+    if args.all:
+        os.makedirs(args.dir, exist_ok=True)
+        # Capture Niri windows
+        try:
+            res_wins = subprocess.check_output(["niri", "msg", "--json", "windows"]).decode()
+            wins = json.loads(res_wins)
+            for w in wins:
+                win_id = w["id"]
+                title_clean = re.sub(r"[^\w\-_\.]", "_", w["title"])[:30]
+                out_name = f"capture_{host_display}_win_{win_id}_{title_clean}.png"
+                out_path = os.path.join(args.dir, out_name)
+                try:
+                    ax, ay, aw, ah = resolve_absolute_rect(host_display, win_id, procs, display_owners, host_display, focus=not args.no_focus)
+                    print(f"[*] Capturing Window {win_id} on {host_display} -> {out_path} ({ax},{ay} {aw}x{ah})")
+                    subprocess.run(["grim", "-g", f"{ax},{ay} {aw}x{ah}", out_path], check=True)
+                except Exception as e:
+                    print(f"❌ Failed to capture window {win_id}: {e}")
+        except Exception as e:
+            print(f"Error querying Niri windows: {e}")
+
+        # Capture nested windows
+        for disp in display_owners.keys():
+            socket_path = f"/tmp/hier-ctrl-{disp}.sock"
+            if not os.path.exists(socket_path):
+                continue
+            wins_str = send_cmd(socket_path, "get_windows")
+            try:
+                wins = json.loads(wins_str)
+                for w in wins:
+                    win_id = w["id"]
+                    title_clean = re.sub(r"[^\w\-_\.]", "_", w["title"])[:30]
+                    out_name = f"capture_{disp}_win_{win_id}_{title_clean}.png"
+                    out_path = os.path.join(args.dir, out_name)
+                    try:
+                        ax, ay, aw, ah = resolve_absolute_rect(disp, win_id, procs, display_owners, host_display, focus=not args.no_focus)
+                        print(f"[*] Capturing Window {win_id} on {disp} -> {out_path} ({ax},{ay} {aw}x{ah})")
+                        subprocess.run(["grim", "-g", f"{ax},{ay} {aw}x{ah}", out_path], check=True)
+                    except Exception as e:
+                        print(f"❌ Failed to capture window {win_id} on {disp}: {e}")
+            except Exception as e:
+                print(f"Error querying windows on nested display {disp}: {e}")
+        sys.exit(0)
+
+    if args.window is None:
+        parser.print_help()
+        sys.exit(1)
+        
+    disp = args.display or host_display
+    win_id = args.window
+    
+    try:
+        ax, ay, aw, ah = resolve_absolute_rect(disp, win_id, procs, display_owners, host_display, focus=not args.no_focus)
+        out_path = args.output or f"capture_{disp}_win_{win_id}.png"
+        print(f"[*] Final absolute geometry resolved: x={ax}, y={ay}, size {aw}x{ah}")
+        print(f"[*] Capturing: grim -g \"{ax},{ay} {aw}x{ah}\" {out_path}")
+        subprocess.run(["grim", "-g", f"{ax},{ay} {aw}x{ah}", out_path], check=True)
+        print(f"✅ Screenshot saved successfully to: {out_path}")
+    except Exception as e:
+        print(f"❌ Error: {e}")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
