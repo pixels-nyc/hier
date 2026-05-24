@@ -1,0 +1,158 @@
+#!/usr/bin/env python3
+# hier-launch
+# Starts the Hier compositor and displays the keyboard shortcuts & gestures cheat sheet in a window.
+
+import sys
+import os
+import subprocess
+import time
+import shutil
+import re
+
+HELP_TEXT = """\033[1;36m
+┌────────────────────────────────────────────────────────┐
+│               HIER COMPOSITOR NAVIGATION               │
+├────────────────────────────────────────────────────────┤
+│ KEYBOARD SHORTCUTS                                     │
+│   Logo + Return         ➔  Spawn Terminal              │
+│   Logo + c              ➔  Toggle Tab Stack / Columns  │
+│   Logo + [h/l/Left/Rt]  ➔  Focus Left/Right Column     │
+│   Logo + [k/j/Up/Down]  ➔  Focus Up/Down Tab Stack     │
+│   Logo + Shift + [h/l]  ➔  Move Left/Right Column      │
+│   Logo + Shift + [k/j]  ➔  Move Up/Down Window         │
+│   Logo + Shift + Q      ➔  Quit Compositor             │
+│   Logo + [1-5]          ➔  Switch Workspace 1-5        │
+├────────────────────────────────────────────────────────┤
+│ GESTURE NAVIGATION & SIMULATED INPUTS                  │
+│   Pointer Motion        ➔  Move Pointer                │
+│   Pointer Axis (Scroll) ➔  Multi-Axis Scroll           │
+│   Z-Axis Scroll (Wheel) ➔  Discrete scroll cycles focus│
+│                            (propagated recursively)    │
+└────────────────────────────────────────────────────────┘
+\033[0m
+Press Enter or close the window to dismiss this help overlay.
+"""
+
+def get_terminal_cmd():
+    for term in ["foot", "alacritty", "kitty", "xterm"]:
+        if shutil.which(term):
+            return term
+    return None
+
+def main():
+    # Detect parent display (for nested sessions)
+    parent_display = os.environ.get("WAYLAND_DISPLAY")
+    
+    # Path to the compositor binary
+    exe_dir = os.path.dirname(os.path.realpath(__file__))
+    comp_bin = os.path.join(exe_dir, "target/debug/hier")
+    if not os.path.exists(comp_bin):
+        comp_bin = "hier"  # Fallback to system path
+        
+    print(f"[*] Starting Hier compositor: {comp_bin}")
+    comp_env = os.environ.copy()
+    if parent_display:
+        print(f"[*] Running in nested mode inside parent display: {parent_display}")
+    
+    # Start the compositor and capture stdout to get its WAYLAND_DISPLAY socket
+    comp_proc = subprocess.Popen(
+        [comp_bin],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        env=comp_env,
+        text=True
+    )
+    
+    child_display = None
+    start_time = time.time()
+    while True:
+        if time.time() - start_time > 10.0:
+            print("❌ Error: Timeout waiting for compositor socket initialization.")
+            comp_proc.terminate()
+            sys.exit(1)
+            
+        line = comp_proc.stdout.readline()
+        if not line:
+            ret = comp_proc.poll()
+            if ret is not None:
+                print(f"❌ Error: Compositor exited early with code {ret}")
+                sys.exit(1)
+            time.sleep(0.05)
+            continue
+            
+        # Match "WAYLAND_DISPLAY=wayland-X"
+        match = re.search(r"WAYLAND_DISPLAY=(wayland-\d+)", line)
+        if match:
+            child_display = match.group(1)
+            print(f"✅ Compositor successfully initialized child display: {child_display}")
+            break
+            
+    # Make stdout non-blocking to let it run in background
+    os.set_blocking(comp_proc.stdout.fileno(), False)
+    
+    # Determine the terminal emulator to launch the help card
+    terminal = get_terminal_cmd()
+    if not terminal:
+        print("⚠️ Warning: No compatible terminal emulator found to show help card.")
+        print(HELP_TEXT)
+        comp_proc.wait()
+        sys.exit(0)
+        
+    # Write the help script to /tmp/hier-help.py to display inside the terminal
+    help_script_path = "/tmp/hier-help.py"
+    with open(help_script_path, "w") as f:
+        f.write(f'''#!/usr/bin/env python3
+import sys
+print("""{HELP_TEXT}""")
+try:
+    input()
+except (KeyboardInterrupt, EOFError):
+    pass
+''')
+    os.chmod(help_script_path, 0o755)
+    
+    # Launch terminal window on the newly created wayland display
+    client_env = os.environ.copy()
+    client_env["WAYLAND_DISPLAY"] = child_display
+    client_env["LIBGL_ALWAYS_SOFTWARE"] = "1"
+    
+    print(f"[*] Launching help card overlay terminal ({terminal}) on display: {child_display}")
+    
+    # Run the terminal with the help script
+    term_proc = None
+    if terminal == "foot":
+        term_proc = subprocess.Popen(["foot", "-T", "Hier Shortcuts & Gestures", help_script_path], env=client_env)
+    elif terminal == "alacritty":
+        term_proc = subprocess.Popen(["alacritty", "-T", "Hier Shortcuts & Gestures", "-e", help_script_path], env=client_env)
+    elif terminal == "kitty":
+        term_proc = subprocess.Popen(["kitty", "-T", "Hier Shortcuts & Gestures", help_script_path], env=client_env)
+    else: # xterm fallback
+        term_proc = subprocess.Popen(["xterm", "-title", "Hier Shortcuts & Gestures", "-e", help_script_path], env=client_env)
+        
+    # Wait for the compositor or help card to finish
+    try:
+        while True:
+            # Check if compositor exited
+            if comp_proc.poll() is not None:
+                print("[*] Compositor exited. Cleaning up help window...")
+                if term_proc and term_proc.poll() is None:
+                    term_proc.terminate()
+                break
+            # Check if terminal exited (meaning user dismissed help card)
+            if term_proc and term_proc.poll() is not None:
+                print("[*] Help card dismissed. Compositor running in background.")
+                break
+            time.sleep(0.5)
+            
+        # Wait for compositor to finish if it is still running
+        comp_proc.wait()
+    except KeyboardInterrupt:
+        print("[*] KeyboardInterrupt received. Cleaning up processes...")
+        if term_proc and term_proc.poll() is None:
+            term_proc.terminate()
+        comp_proc.terminate()
+        
+    print("[*] Exit.")
+
+if __name__ == "__main__":
+    main()

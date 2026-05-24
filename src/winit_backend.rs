@@ -183,6 +183,15 @@ pub fn run_winit_compositor() -> Result<(), Box<dyn std::error::Error>> {
         match event {
             WinitEvent::Resized { size, .. } => {
                 state.layout_engine.resize_viewport(size.w as f32, size.h as f32);
+                state.output.change_current_state(
+                    Some(OutputMode {
+                        size: (size.w as i32, size.h as i32).into(),
+                        refresh: 60000,
+                    }),
+                    None,
+                    None,
+                    None,
+                );
                 state.reposition_windows();
             }
             WinitEvent::Input(event) => {
