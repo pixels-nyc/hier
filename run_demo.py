@@ -149,10 +149,36 @@ def get_active_output_transform() -> str:
         pass
     return "Normal"
 
-def spawn_compositor(parent_display=None, host_transform="Normal"):
+def get_primary_display_name() -> str:
+    try:
+        res = subprocess.check_output(["niri", "msg", "--json", "outputs"]).decode()
+        outputs = json.loads(res)
+        if not outputs:
+            return "HDMI-A-2"
+        # Strategy 1: Find output with x=0, y=0
+        for name, info in outputs.items():
+            logical = info.get("logical", {})
+            if logical.get("x") == 0 and logical.get("y") == 0:
+                return name
+        # Strategy 2: Find output with transform "Normal"
+        for name, info in outputs.items():
+            logical = info.get("logical", {})
+            if logical.get("transform") == "Normal":
+                return name
+        # Strategy 3: Check if HDMI-A-2 exists
+        if "HDMI-A-2" in outputs:
+            return "HDMI-A-2"
+        # Strategy 4: Fallback to first output
+        return list(outputs.keys())[0]
+    except Exception:
+        return "HDMI-A-2"
+
+def spawn_compositor(parent_display=None, host_transform="Normal", fullscreen=False):
     env = os.environ.copy()
     if parent_display:
         env["WAYLAND_DISPLAY"] = parent_display
+    if fullscreen:
+        env["HIER_FULLSCREEN"] = "1"
     env["HIER_HOST_TRANSFORM"] = host_transform
     env["LIBGL_ALWAYS_SOFTWARE"] = "1"
     
@@ -221,17 +247,22 @@ def main():
 
     # 1. Start Nest 0 (Root nested compositor)
     parent_wayland = os.environ.get("WAYLAND_DISPLAY", "wayland-1")
+    primary_display = get_primary_display_name()
+    print(f"[*] Focusing primary display monitor {primary_display} via Niri IPC...")
+    subprocess.run(["niri", "msg", "action", "focus-monitor", primary_display], check=False)
+    time.sleep(0.5)
+
     print(f"[*] Spawning Nest 0 root compositor under parent: {parent_wayland}...")
     host_transform = get_active_output_transform()
     print(f"[*] Detected active host monitor transform: {host_transform}")
-    comp0, display0, logs0 = spawn_compositor(host_transform=host_transform)
+    comp0, display0, logs0 = spawn_compositor(host_transform=host_transform, fullscreen=True)
     print(f"✅ Nest 0 successfully initialized display: {display0}")
     socket_n0 = f"/tmp/hier-ctrl-{display0}.sock"
     time.sleep(2.0)
 
     # 2. Start Nest 1 (Nested child compositor connected to display0)
     print(f"[*] Spawning Nest 1 nested child compositor inside parent: {display0}...")
-    comp1, display1, logs1 = spawn_compositor(parent_display=display0)
+    comp1, display1, logs1 = spawn_compositor(parent_display=display0, fullscreen=False)
     print(f"✅ Nest 1 successfully initialized display: {display1}")
     socket_n1 = f"/tmp/hier-ctrl-{display1}.sock"
     time.sleep(2.0)

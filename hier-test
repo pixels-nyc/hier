@@ -8,6 +8,32 @@ import time
 import subprocess
 import re
 import glob
+import json
+
+def get_primary_display_name() -> str:
+    try:
+        res = subprocess.check_output(["niri", "msg", "--json", "outputs"]).decode()
+        outputs = json.loads(res)
+        if not outputs:
+            return "HDMI-A-2"
+        # Strategy 1: Find output with x=0, y=0
+        for name, info in outputs.items():
+            logical = info.get("logical", {})
+            if logical.get("x") == 0 and logical.get("y") == 0:
+                return name
+        # Strategy 2: Find output with transform "Normal"
+        for name, info in outputs.items():
+            logical = info.get("logical", {})
+            if logical.get("transform") == "Normal":
+                return name
+        # Strategy 3: Check if HDMI-A-2 exists
+        if "HDMI-A-2" in outputs:
+            return "HDMI-A-2"
+        # Strategy 4: Fallback to first output
+        return list(outputs.keys())[0]
+    except Exception:
+        return "HDMI-A-2"
+
 
 def print_banner(text):
     print("=" * 60)
@@ -65,8 +91,14 @@ def main():
 
     # Stage 3: Vision Agent Verification (using vision_agent.py against a dynamic compositor)
     print("\n[*] Starting Stage: Standalone Vision Agent Verification...")
+    primary_display = get_primary_display_name()
+    print(f"[*] Focusing primary display monitor {primary_display} via Niri IPC...")
+    subprocess.run(["niri", "msg", "action", "focus-monitor", primary_display], check=False)
+    time.sleep(0.5)
+
     comp_env = os.environ.copy()
     comp_env["LIBGL_ALWAYS_SOFTWARE"] = "1"
+    comp_env["HIER_FULLSCREEN"] = "1"
     
     # Spawn a fresh compositor
     try:
@@ -137,11 +169,21 @@ def main():
     # Stage 6: Telemetry Diagnostics grabber verification
     print("\n[*] Starting Stage: Telemetry Diagnostics Verification...")
     try:
+        primary_display = get_primary_display_name()
+        print(f"[*] Focusing primary display monitor {primary_display} via Niri IPC...")
+        subprocess.run(["niri", "msg", "action", "focus-monitor", primary_display], check=False)
+        time.sleep(0.5)
+
+        comp_env = os.environ.copy()
+        comp_env["LIBGL_ALWAYS_SOFTWARE"] = "1"
+        comp_env["HIER_FULLSCREEN"] = "1"
+
         # Start a temporary compositor to allow diagnostics socket query
         comp_proc = subprocess.Popen(
             ["target/debug/hier"],
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
+            env=comp_env,
             cwd=base_dir,
             text=True
         )

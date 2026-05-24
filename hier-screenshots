@@ -33,6 +33,30 @@ def get_active_output_transform() -> str:
         print(f"Warning detecting active output transform: {e}")
     return "Normal"
 
+def get_primary_display_name() -> str:
+    try:
+        res = subprocess.check_output(["niri", "msg", "--json", "outputs"]).decode()
+        outputs = json.loads(res)
+        if not outputs:
+            return "HDMI-A-2"
+        # Strategy 1: Find output with x=0, y=0
+        for name, info in outputs.items():
+            logical = info.get("logical", {})
+            if logical.get("x") == 0 and logical.get("y") == 0:
+                return name
+        # Strategy 2: Find output with transform "Normal"
+        for name, info in outputs.items():
+            logical = info.get("logical", {})
+            if logical.get("transform") == "Normal":
+                return name
+        # Strategy 3: Check if HDMI-A-2 exists
+        if "HDMI-A-2" in outputs:
+            return "HDMI-A-2"
+        # Strategy 4: Fallback to first output
+        return list(outputs.keys())[0]
+    except Exception:
+        return "HDMI-A-2"
+
 def send_cmd(socket_path: str, cmd: str) -> str:
     try:
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -239,6 +263,11 @@ def main():
     # Detect the active output transform first so we can pass it to Nest 0
     host_transform = get_active_output_transform()
     print(f"[*] Detected active host monitor transform: {host_transform}")
+
+    primary_display = get_primary_display_name()
+    print(f"[*] Focusing primary display monitor {primary_display} via Niri IPC...")
+    subprocess.run(["niri", "msg", "action", "focus-monitor", primary_display], check=False)
+    time.sleep(0.5)
 
     print("[*] Spawning Nest 0 (Root nested compositor) in fullscreen...")
     comp0, display0 = spawn_compositor(fullscreen=True, host_transform=host_transform)

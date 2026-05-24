@@ -115,6 +115,11 @@ impl State {
             self.space.unmap_elem(window);
         }
 
+        // Dynamically update the output's location in the space based on animated camera viewport coordinates
+        let vx = self.layout_engine.viewport.x as i32;
+        let vy = self.layout_engine.viewport.y as i32;
+        self.space.map_output(&self.output.clone(), (vx, vy));
+
         // Loop through current active workspace's columns and map the focused window of each column
         let active_ws = self.layout_engine.active_workspace();
 
@@ -177,8 +182,14 @@ impl State {
 
                 let pointer = self.seat.get_pointer().unwrap();
 
-                // Hit-test: query what window is under the pointer
-                let under = self.space.element_under(pos);
+                // Translate pointer screen coordinates to space coordinates by adding the camera viewport offset
+                let space_pos = pos + Point::from((
+                    self.layout_engine.viewport.x as f64,
+                    self.layout_engine.viewport.y as f64,
+                ));
+
+                // Hit-test: query what window is under the pointer in space coordinates
+                let under = self.space.element_under(space_pos);
                 let focus = under.and_then(|(win, local_pos)| {
                     win.surface_under(
                         local_pos.to_f64(),
@@ -193,7 +204,7 @@ impl State {
                     self,
                     focus,
                     &smithay::input::pointer::MotionEvent {
-                        location: pos,
+                        location: space_pos,
                         time,
                         serial,
                     },
@@ -763,7 +774,9 @@ impl State {
                                 && ws.focused_column_idx == col_idx
                                 && col.focused_window_idx == win_idx;
                             let rect_str = if let Some((x, y, w, h)) = self.layout_engine.get_window_rect(win.id) {
-                                format!("{},{},{},{}", x, y, w, h)
+                                let screen_x = x - self.layout_engine.viewport.x;
+                                let screen_y = y - self.layout_engine.viewport.y;
+                                format!("{},{},{},{}", screen_x as i32, screen_y as i32, w as i32, h as i32)
                             } else {
                                 "0,0,0,0".to_string()
                             };
