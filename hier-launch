@@ -43,6 +43,9 @@ def main():
     # Detect parent display (for nested sessions)
     parent_display = os.environ.get("WAYLAND_DISPLAY")
     
+    # Check for fullscreen argument
+    fullscreen = "--fullscreen" in sys.argv or "-f" in sys.argv
+    
     # Path to the compositor binary
     exe_dir = os.path.dirname(os.path.realpath(__file__))
     comp_bin = os.path.join(exe_dir, "target/debug/hier")
@@ -51,6 +54,9 @@ def main():
         
     print(f"[*] Starting Hier compositor: {comp_bin}")
     comp_env = os.environ.copy()
+    if fullscreen:
+        comp_env["HIER_FULLSCREEN"] = "1"
+        print("[*] Launching in Fullscreen mode...")
     if parent_display:
         print(f"[*] Running in nested mode inside parent display: {parent_display}")
     

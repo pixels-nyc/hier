@@ -30,6 +30,9 @@ pub fn run_winit_compositor() -> Result<(), Box<dyn std::error::Error>> {
     let backend = Rc::new(RefCell::new(backend));
 
     let size = backend.borrow().window().inner_size();
+    if std::env::var("HIER_FULLSCREEN").is_ok() {
+        backend.borrow().window().set_fullscreen(Some(::winit::window::Fullscreen::Borderless(None)));
+    }
     let layout_engine = crate::layout::LayoutEngine::new(
         size.width as f32,
         size.height as f32,
