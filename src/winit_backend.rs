@@ -3,6 +3,8 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Duration;
+use std::process::Command;
+use serde_json::Value;
 use smithay::{
     backend::winit::{self, WinitEvent},
     reexports::calloop::{EventLoop, Interest, Mode},
@@ -17,6 +19,87 @@ smithay::backend::renderer::element::render_elements! {
     pub MyRenderElement<=smithay::backend::renderer::gles::GlesRenderer>;
     Space = smithay::desktop::space::SpaceRenderElements<smithay::backend::renderer::gles::GlesRenderer, smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement<smithay::backend::renderer::gles::GlesRenderer>>,
     Solid = smithay::backend::renderer::element::solid::SolidColorRenderElement,
+}
+
+pub fn detect_host_transform() -> Transform {
+    let pid = std::process::id() as i64;
+    
+    // 1. Get workspace_id of our window
+    let workspace_id = match Command::new("niri")
+        .args(&["msg", "--json", "windows"])
+        .output()
+    {
+        Ok(output) => {
+            if let Ok(val) = serde_json::from_slice::<Value>(&output.stdout) {
+                if let Some(arr) = val.as_array() {
+                    arr.iter()
+                        .find(|win| win["pid"].as_i64() == Some(pid) || win["title"].as_str() == Some("Smithay"))
+                        .and_then(|win| win["workspace_id"].as_i64())
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
+        Err(_) => None,
+    };
+    
+    let workspace_id = match workspace_id {
+        Some(id) => id,
+        None => return Transform::Flipped180,
+    };
+    
+    // 2. Get output name of our workspace
+    let output_name = match Command::new("niri")
+        .args(&["msg", "--json", "workspaces"])
+        .output()
+    {
+        Ok(output) => {
+            if let Ok(val) = serde_json::from_slice::<Value>(&output.stdout) {
+                if let Some(arr) = val.as_array() {
+                    arr.iter()
+                        .find(|ws| ws["id"].as_i64() == Some(workspace_id))
+                        .and_then(|ws| ws["output"].as_str())
+                        .map(|s| s.to_string())
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
+        Err(_) => None,
+    };
+    
+    let output_name = match output_name {
+        Some(name) => name,
+        None => return Transform::Flipped180,
+    };
+    
+    // 3. Get transform of our output
+    let transform_str = match Command::new("niri")
+        .args(&["msg", "--json", "outputs"])
+        .output()
+    {
+        Ok(output) => {
+            if let Ok(val) = serde_json::from_slice::<Value>(&output.stdout) {
+                val.get(&output_name)
+                    .and_then(|out| out.get("logical"))
+                    .and_then(|log| log.get("transform"))
+                    .and_then(|trans| trans.as_str())
+                    .map(|s| s.to_string())
+            } else {
+                None
+            }
+        }
+        Err(_) => None,
+    };
+    
+    match transform_str.as_deref() {
+        Some("180") => Transform::Normal,
+        _ => Transform::Flipped180,
+    }
 }
 
 pub fn run_winit_compositor() -> Result<(), Box<dyn std::error::Error>> {
@@ -52,12 +135,16 @@ pub fn run_winit_compositor() -> Result<(), Box<dyn std::error::Error>> {
         },
     );
     output.create_global::<State>(&display_handle);
+    
+    let initial_transform = detect_host_transform();
+    println!("Detected host transform: {:?}", initial_transform);
+
     output.change_current_state(
         Some(OutputMode {
             size: (size.width as i32, size.height as i32).into(),
             refresh: 60000,
         }),
-        Some(Transform::Flipped180),
+        Some(initial_transform),
         Some(Scale::Integer(1)),
         Some((0, 0).into()),
     );
@@ -186,12 +273,13 @@ pub fn run_winit_compositor() -> Result<(), Box<dyn std::error::Error>> {
         match event {
             WinitEvent::Resized { size, .. } => {
                 state.layout_engine.resize_viewport(size.w as f32, size.h as f32);
+                let current_transform = detect_host_transform();
                 state.output.change_current_state(
                     Some(OutputMode {
                         size: (size.w as i32, size.h as i32).into(),
                         refresh: 60000,
                     }),
-                    None,
+                    Some(current_transform),
                     None,
                     None,
                 );
@@ -216,6 +304,8 @@ pub fn run_winit_compositor() -> Result<(), Box<dyn std::error::Error>> {
                         &state.output,
                         1.0f32,
                     ).expect("failed to get space render elements");
+
+                    println!("DEBUG RENDER: space_elements len = {}", space_elements.len());
 
                     let mut render_elements = Vec::new();
 
@@ -317,6 +407,9 @@ pub fn run_winit_compositor() -> Result<(), Box<dyn std::error::Error>> {
 
         display.dispatch_clients(&mut state)?;
         display.flush_clients()?;
+
+        // Request winit window redraw on every tick to draw client updates and animations
+        backend.borrow().window().request_redraw();
     }
 
     Ok(())

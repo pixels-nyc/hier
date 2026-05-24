@@ -164,7 +164,16 @@ impl State {
                 let serial = SERIAL_COUNTER.next_serial();
                 let time = event.time_msec();
                 let raw_pos = event.position();
-                let pos = Point::from((raw_pos.x, raw_pos.y));
+                let mut pos = Point::from((raw_pos.x, raw_pos.y));
+
+                if self.output.current_transform() == smithay::utils::Transform::Flipped180 {
+                    if let Some(mode) = self.output.current_mode() {
+                        pos = Point::from((
+                            (mode.size.w - pos.x as i32) as f64,
+                            (mode.size.h - pos.y as i32) as f64,
+                        ));
+                    }
+                }
 
                 let pointer = self.seat.get_pointer().unwrap();
 
