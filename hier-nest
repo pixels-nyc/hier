@@ -1,0 +1,131 @@
+#!/usr/bin/env python3
+# hier-nest
+# Recursive nested compositor launcher and client orchestrator
+
+import sys
+import os
+import subprocess
+import re
+import time
+
+def print_help():
+    print("Usage: hier-nest <nest_level> <command...>")
+    print("Example: hier-nest 1 foot")
+    print("Example: hier-nest 1 alacritty")
+    print("Example: hier-nest 2 --software xterm")
+    sys.exit(1)
+
+def main():
+    if len(sys.argv) < 3:
+        print_help()
+
+    try:
+        nest_level = int(sys.argv[1])
+    except ValueError:
+        print("Error: nest_level must be an integer.")
+        print_help()
+
+    command_args = sys.argv[2:]
+
+    # Resolve parent display.
+    # Use the active WAYLAND_DISPLAY environment variable if present.
+    # Otherwise fallback to wayland-{nest_level}.
+    parent_display = os.environ.get("WAYLAND_DISPLAY")
+    if not parent_display:
+        parent_display = f"wayland-{nest_level}"
+    print(f"[*] Launching nested compositor (Nest {nest_level}) inside parent display: {parent_display}")
+
+    # Build environment for the child compositor
+    comp_env = os.environ.copy()
+    comp_env["WAYLAND_DISPLAY"] = parent_display
+
+    # Path to the compositor binary
+    exe_dir = os.path.dirname(os.path.realpath(__file__))
+    comp_bin = os.path.join(exe_dir, "target/debug/hier")
+    if not os.path.exists(comp_bin):
+        comp_bin = "hier"  # Fallback to system path
+
+    # Spawn the nested compositor, capturing stdout to read the allocated socket name
+    print(f"[*] Executing child compositor: {comp_bin}")
+    try:
+        proc = subprocess.Popen(
+            [comp_bin],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env=comp_env,
+            text=True
+        )
+    except Exception as e:
+        print(f"❌ Error: Failed to spawn compositor process: {e}")
+        sys.exit(1)
+
+    child_display = None
+    # Read stdout line-by-line to parse the WAYLAND_DISPLAY line
+    start_time = time.time()
+    while True:
+        if time.time() - start_time > 10.0:
+            print("❌ Error: Timeout waiting for nested compositor socket initialization.")
+            proc.terminate()
+            sys.exit(1)
+
+        line = proc.stdout.readline()
+        if not line:
+            # Check if process terminated early
+            ret = proc.poll()
+            if ret is not None:
+                print(f"❌ Error: Compositor exited early with code {ret}")
+                sys.exit(1)
+            time.sleep(0.05)
+            continue
+
+        print(f"[Compositor Output] {line.strip()}")
+        # Match "WAYLAND_DISPLAY=wayland-X"
+        match = re.search(r"WAYLAND_DISPLAY=(wayland-\d+)", line)
+        if match:
+            child_display = match.group(1)
+            print(f"✅ Nested compositor successfully initialized child display: {child_display}")
+            break
+
+    # Make stdout non-blocking so we don't hang, and let it run in the background
+    os.set_blocking(proc.stdout.fileno(), False)
+
+    # Spawn the target client program inside the child display
+    print(f"[*] Spawning client app: {' '.join(command_args)} under display: {child_display}")
+    
+    # Setup environment for the client
+    client_env = os.environ.copy()
+    client_env["WAYLAND_DISPLAY"] = child_display
+
+    # We run the command via the sandbox script for maximum security nesting
+    sandbox_script = os.path.join(exe_dir, "sandbox_run.sh")
+    if os.path.exists(sandbox_script):
+        # Pass the arguments to sandbox_run.sh
+        client_cmd = [sandbox_script] + command_args
+        print(f"[*] Wrapping client in sandbox container: {sandbox_script}")
+    else:
+        client_cmd = command_args
+
+    try:
+        client_proc = subprocess.Popen(
+            client_cmd,
+            env=client_env
+        )
+        print(f"✅ Client spawned successfully (PID: {client_proc.pid})")
+    except Exception as e:
+        print(f"❌ Error: Failed to spawn client program: {e}")
+        proc.terminate()
+        sys.exit(1)
+
+    # Wait for the client to exit, then terminate the child compositor
+    try:
+        client_proc.wait()
+        print("[*] Client program exited. Terminating nested compositor...")
+    except KeyboardInterrupt:
+        print("[*] KeyboardInterrupt received. Cleaning up processes...")
+        client_proc.terminate()
+    
+    proc.terminate()
+    print("[*] Cleanup complete.")
+
+if __name__ == "__main__":
+    main()

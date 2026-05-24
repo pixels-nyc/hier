@@ -1,0 +1,225 @@
+#!/usr/bin/env python3
+# hier-multiview
+# Inspects and displays workspaces, windows, and geometry in active nested compositors
+
+import sys
+import os
+import socket
+import argparse
+import re
+import glob
+import struct
+import zlib
+
+def save_png(width, height, rgb_bytes, output_path):
+    png = bytearray([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+    ihdr_data = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    
+    def make_chunk(tag, data):
+        chunk = bytearray()
+        chunk.extend(struct.pack(">I", len(data)))
+        chunk.extend(tag.encode('ascii'))
+        chunk.extend(data)
+        crc = zlib.crc32(tag.encode('ascii') + data)
+        chunk.extend(struct.pack(">I", crc))
+        return chunk
+
+    png.extend(make_chunk("IHDR", ihdr_data))
+    
+    scanlines = bytearray()
+    row_len = width * 3
+    for y in range(height):
+        scanlines.append(0)
+        scanlines.extend(rgb_bytes[y * row_len : (y + 1) * row_len])
+        
+    compressed_data = zlib.compress(scanlines)
+    png.extend(make_chunk("IDAT", compressed_data))
+    png.extend(make_chunk("IEND", b""))
+    
+    with open(output_path, "wb") as f:
+        f.write(png)
+
+def ppm_to_png(ppm_path, png_path):
+    with open(ppm_path, "rb") as f:
+        header = f.readline().decode().strip()
+        if header != "P6":
+            raise ValueError("Unsupported PPM format")
+        
+        line = f.readline().decode().strip()
+        while line.startswith("#"):
+            line = f.readline().decode().strip()
+        dims = line.split()
+        width = int(dims[0])
+        height = int(dims[1])
+        
+        f.readline() # Read max value line
+        pixel_bytes = f.read()
+        
+    save_png(width, height, pixel_bytes, png_path)
+
+def send_cmd(socket_path: str, cmd: str) -> str:
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(0.5)
+        s.connect(socket_path)
+        s.sendall((cmd + "\n").encode())
+        res = ""
+        while True:
+            try:
+                chunk = s.recv(4096).decode()
+                if not chunk:
+                    break
+                res += chunk
+            except socket.timeout:
+                break
+        s.close()
+        return res
+    except Exception as e:
+        return f"error: {e}"
+
+def parse_layout(layout_str: str):
+    # ws_idx -> { col_idx -> [windows] }
+    workspaces = {}
+    
+    lines = layout_str.strip().split("\n")
+    for line in lines:
+        if not line or line.startswith("error:"):
+            continue
+        parts = line.split(":", 5)
+        if len(parts) < 6:
+            continue
+            
+        try:
+            ws_idx = int(parts[0])
+            col_idx = int(parts[1])
+            win_id = int(parts[2])
+            is_focused = parts[3].lower() == "true"
+            rect = parts[4] # x,y,w,h
+            title = parts[5]
+        except ValueError:
+            continue
+            
+        workspaces.setdefault(ws_idx, {}).setdefault(col_idx, []).append({
+            "id": win_id,
+            "focused": is_focused,
+            "rect": rect,
+            "title": title
+        })
+    return workspaces
+
+def render_display_tree(display_name: str, workspaces: dict):
+    print(f"==================================================")
+    print(f" DISPLAY: [{display_name}]")
+    print(f"==================================================")
+    
+    if not workspaces:
+        print("└── (No active workspaces or mapped windows)")
+        print()
+        return
+        
+    sorted_workspaces = sorted(workspaces.keys())
+    for ws_idx in sorted_workspaces:
+        cols = workspaces[ws_idx]
+        is_last_ws = (ws_idx == sorted_workspaces[-1])
+        ws_prefix = "└── " if is_last_ws else "├── "
+        ws_child_prefix = "    " if is_last_ws else "│   "
+        
+        print(f"{ws_prefix}Workspace {ws_idx + 1}")
+        
+        if not cols:
+            print(f"{ws_child_prefix}└── (Empty)")
+            continue
+            
+        sorted_cols = sorted(cols.keys())
+        for col_idx in sorted_cols:
+            wins = cols[col_idx]
+            is_last_col = (col_idx == sorted_cols[-1])
+            col_prefix = "└── " if is_last_col else "├── "
+            col_child_prefix = ws_child_prefix + ("    " if is_last_col else "│   ")
+            
+            is_stacked = len(wins) > 1
+            col_info = " (Tab Stack)" if is_stacked else ""
+            print(f"{ws_child_prefix}{col_prefix}Column {col_idx}{col_info}")
+            
+            for idx, win in enumerate(wins):
+                is_last_win = (idx == len(wins) - 1)
+                win_prefix = "└── " if is_last_win else "├── "
+                focus_marker = "[★]" if win["focused"] else "[ ]"
+                print(f"{col_child_prefix}{win_prefix}{focus_marker} Window ID {win['id']}: \"{win['title']}\" [{win['rect']}]")
+    print()
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Inspect and visualize active workspaces and windows in hier nested displays."
+    )
+    parser.add_argument(
+        "--display", "-d",
+        help="Target Wayland display (e.g. wayland-2). Defaults to $WAYLAND_DISPLAY."
+    )
+    parser.add_argument(
+        "--all", "-a",
+        action="store_true",
+        help="Scan and visualize all active nested displays."
+    )
+    parser.add_argument(
+        "--screenshot-dir", "-s",
+        help="Directory to save window screenshots to."
+    )
+    
+    args = parser.parse_args()
+    
+    targets = []
+    if args.all:
+        # Scan /tmp/hier-ctrl-*.sock
+        pattern = "/tmp/hier-ctrl-wayland-*.sock"
+        for path in glob.glob(pattern):
+            match = re.search(r"hier-ctrl-(wayland-\d+)\.sock", path)
+            if match:
+                targets.append(match.group(1))
+        targets.sort()
+        if not targets:
+            print("❌ No active hier control sockets found in /tmp.")
+            sys.exit(1)
+    else:
+        disp = args.display or os.environ.get("WAYLAND_DISPLAY")
+        if not disp:
+            print("❌ Error: No Wayland display specified. Run inside Nest(N) or specify --display / --all.")
+            sys.exit(1)
+        targets.append(disp)
+        
+    for disp in targets:
+        socket_path = f"/tmp/hier-ctrl-{disp}.sock"
+        if not os.path.exists(socket_path):
+            print(f"⚠️ Warning: Control socket for display '{disp}' not found at: {socket_path}")
+            continue
+            
+        layout_str = send_cmd(socket_path, "get_layout_compact")
+        if layout_str.startswith("error:"):
+            print(f"❌ Failed to query layout for display '{disp}': {layout_str.strip()}")
+            continue
+            
+        workspaces = parse_layout(layout_str)
+        render_display_tree(disp, workspaces)
+
+        if args.screenshot_dir:
+            os.makedirs(args.screenshot_dir, exist_ok=True)
+            for ws_idx, cols in workspaces.items():
+                for col_idx, wins in cols.items():
+                    for win in wins:
+                        win_id = win["id"]
+                        temp_ppm_path = os.path.join(args.screenshot_dir, f"capture_{disp}_win_{win_id}.ppm")
+                        png_path = os.path.join(args.screenshot_dir, f"capture_{disp}_win_{win_id}.png")
+                        print(f"[*] Capturing screenshot of Window {win_id} on display {disp}...")
+                        res = send_cmd(socket_path, f"capture_window {win_id} {temp_ppm_path}")
+                        if "error" in res.lower() or not os.path.exists(temp_ppm_path):
+                            print(f"  ❌ Failed to capture window {win_id}: {res.strip()}")
+                        else:
+                            try:
+                                ppm_to_png(temp_ppm_path, png_path)
+                                os.remove(temp_ppm_path)
+                                print(f"  ✅ Saved screenshot to: {png_path}")
+                            except Exception as e:
+                                print(f"  ❌ Failed to convert PPM to PNG for window {win_id}: {e}")
+
+if __name__ == "__main__":
+    main()

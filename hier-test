@@ -1,0 +1,213 @@
+#!/usr/bin/env python3
+# hier-test
+# Unified base test program system for hier
+
+import os
+import sys
+import time
+import subprocess
+import re
+import glob
+
+def print_banner(text):
+    print("=" * 60)
+    print(f" {text:^58} ")
+    print("=" * 60)
+
+def run_stage(name, cmd, cwd=None, env=None, timeout=60.0):
+    print(f"\n[*] Starting Stage: {name}...")
+    print(f"[*] Command: {' '.join(cmd)}")
+    start = time.time()
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=cwd,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=timeout
+        )
+        duration = time.time() - start
+        if proc.returncode == 0:
+            print(f"✅ Stage {name} completed successfully in {duration:.2f}s.")
+            return True, proc.stdout
+        else:
+            print(f"❌ Stage {name} FAILED with exit code {proc.returncode} in {duration:.2f}s.")
+            return False, proc.stdout
+    except subprocess.TimeoutExpired:
+        print(f"❌ Stage {name} TIMED OUT after {timeout}s.")
+        return False, "TIMEOUT"
+    except Exception as e:
+        print(f"❌ Stage {name} encountered error: {e}")
+        return False, str(e)
+
+def main():
+    print_banner("HIER BASE TEST PROGRAM SYSTEM")
+    results = {}
+    
+    # Resolve paths
+    base_dir = os.path.dirname(os.path.realpath(__file__))
+    artifacts_dir = "/home/super/.gemini/antigravity/brain/f93f86a1-b0d6-49ce-b82f-d76376c60ee0"
+    scratch_z_scroll_test = os.path.join(artifacts_dir, "scratch/test_scroll_rpa_z.py")
+
+    # Stage 1: Cargo Compilation
+    ok, out = run_stage("Cargo Build", ["cargo", "build"], cwd=base_dir)
+    results["1. Cargo Build"] = (ok, out)
+    if not ok:
+        print("[!] Cargo build failed. Skipping subsequent stages.")
+        print(out)
+        sys.exit(1)
+
+    # Stage 2: Cargo Unit & Tiling Tests
+    ok, out = run_stage("Cargo Test", ["cargo", "test"], cwd=base_dir)
+    results["2. Cargo Test"] = (ok, out)
+
+    # Stage 3: Vision Agent Verification (using vision_agent.py against a dynamic compositor)
+    print("\n[*] Starting Stage: Standalone Vision Agent Verification...")
+    comp_env = os.environ.copy()
+    comp_env["LIBGL_ALWAYS_SOFTWARE"] = "1"
+    
+    # Spawn a fresh compositor
+    try:
+        comp_proc = subprocess.Popen(
+            ["target/debug/hier"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env=comp_env,
+            cwd=base_dir,
+            text=True
+        )
+        
+        # Read stdout to parse display name
+        display_name = None
+        start_time = time.time()
+        while time.time() - start_time < 5.0:
+            line = comp_proc.stdout.readline()
+            if not line:
+                time.sleep(0.05)
+                continue
+            match = re.search(r"WAYLAND_DISPLAY=(wayland-\d+)", line)
+            if match:
+                display_name = match.group(1)
+                break
+                
+        if not display_name:
+            print("❌ Failed to parse WAYLAND_DISPLAY from compositor.")
+            comp_proc.terminate()
+            results["3. Vision Agent Verification"] = (False, "Compositor startup timeout")
+        else:
+            print(f"✅ Compositor started on display: {display_name}")
+            time.sleep(2.0)
+            
+            # Spawn a client window in the compositor
+            client_env = os.environ.copy()
+            client_env["WAYLAND_DISPLAY"] = display_name
+            client_env["LIBGL_ALWAYS_SOFTWARE"] = "1"
+            client_proc = subprocess.Popen(["alacritty"], env=client_env)
+            time.sleep(2.5) # allow client map
+            
+            # Run vision_agent.py targeted at this compositor
+            agent_env = os.environ.copy()
+            agent_env["WAYLAND_DISPLAY"] = display_name
+            agent_env["HIER_CTRL_SOCKET"] = f"/tmp/hier-ctrl-{display_name}.sock"
+            
+            ok, out = run_stage("Vision Agent Execution", ["python3", "vision_agent.py"], cwd=base_dir, env=agent_env)
+            results["3. Vision Agent Verification"] = (ok, out)
+            
+            # Cleanup client and compositor
+            client_proc.terminate()
+            comp_proc.terminate()
+    except Exception as e:
+        print(f"❌ Error in Vision Agent Verification: {e}")
+        results["3. Vision Agent Verification"] = (False, str(e))
+
+    # Stage 4: Unified Visual Demonstration Tiling, Stacked Tab, Session Save/Restore
+    ok, out = run_stage("Unified Demo Pipeline", ["python3", "run_demo.py"], cwd=base_dir)
+    results["4. Unified Demo Pipeline"] = (ok, out)
+
+    # Stage 5: Nesting Scroll Propagation
+    if os.path.exists(scratch_z_scroll_test):
+        ok, out = run_stage("Nesting Z-Scroll Propagation", ["python3", scratch_z_scroll_test], cwd=base_dir)
+        results["5. Nesting Z-Scroll Propagation"] = (ok, out)
+    else:
+        print(f"[!] Warning: Scratch test script not found at {scratch_z_scroll_test}. Skipping Stage 5.")
+        results["5. Nesting Z-Scroll Propagation"] = (False, "Scratch test script missing")
+
+    # Stage 6: Telemetry Diagnostics grabber verification
+    print("\n[*] Starting Stage: Telemetry Diagnostics Verification...")
+    try:
+        # Start a temporary compositor to allow diagnostics socket query
+        comp_proc = subprocess.Popen(
+            ["target/debug/hier"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            cwd=base_dir,
+            text=True
+        )
+        display_name = None
+        start_time = time.time()
+        while time.time() - start_time < 5.0:
+            line = comp_proc.stdout.readline()
+            if not line:
+                time.sleep(0.05)
+                continue
+            match = re.search(r"WAYLAND_DISPLAY=(wayland-\d+)", line)
+            if match:
+                display_name = match.group(1)
+                break
+        
+        if not display_name:
+            print("❌ Failed to start compositor for diagnostics test.")
+            results["6. Telemetry Diagnostics"] = (False, "Compositor startup timeout")
+        else:
+            time.sleep(2.0)
+            # Run diagnostics grabber
+            diag_env = os.environ.copy()
+            diag_env["WAYLAND_DISPLAY"] = display_name
+            diag_env["HIER_CTRL_SOCKET"] = f"/tmp/hier-ctrl-{display_name}.sock"
+            
+            ok, out = run_stage("Feedback Telemetry Gathering", ["python3", "hier-feedback"], cwd=base_dir, env=diag_env)
+            comp_proc.terminate()
+            
+            # Verify the generated package
+            if ok:
+                match = re.search(r"/tmp/hier-feedback-\d+\.tar\.gz", out)
+                if match:
+                    package_path = match.group(0)
+                    if os.path.exists(package_path):
+                        print(f"✅ Found generated telemetry package at: {package_path}")
+                        os.remove(package_path) # Clean up
+                        results["6. Telemetry Diagnostics"] = (True, out)
+                    else:
+                        print("❌ Telemetry package file was reported but does not exist.")
+                        results["6. Telemetry Diagnostics"] = (False, "Package file missing")
+                else:
+                    print("❌ Could not parse package path from feedback script output.")
+                    results["6. Telemetry Diagnostics"] = (False, "Regex parse failure")
+            else:
+                results["6. Telemetry Diagnostics"] = (False, out)
+    except Exception as e:
+        print(f"❌ Error in Telemetry Diagnostics Stage: {e}")
+        results["6. Telemetry Diagnostics"] = (False, str(e))
+
+    # Print Final Summary Matrix
+    print_banner("TEST RUN REPORT SUMMARY MATRIX")
+    all_passed = True
+    for stage_name, (ok, out) in results.items():
+        status = "PASSED" if ok else "FAILED"
+        status_emoji = "✅" if ok else "❌"
+        print(f" {status_emoji} {stage_name:<35} : {status}")
+        if not ok:
+            all_passed = False
+            
+    print("=" * 60)
+    if all_passed:
+        print("🎉 ALL STAGES PASSED SUCCESSFULLY!")
+        sys.exit(0)
+    else:
+        print("🚨 ONE OR MORE STAGES FAILED. Inspect logs above.")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

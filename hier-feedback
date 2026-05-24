@@ -1,0 +1,122 @@
+#!/usr/bin/env python3
+# hier-feedback
+# User-based testing feedback session diagnostics grabber
+
+import socket
+import sys
+import os
+import time
+import subprocess
+import json
+import tarfile
+
+SOCKET_PATH = os.environ.get(
+    "HIER_CTRL_SOCKET",
+    f"/tmp/hier-ctrl-{os.environ.get('WAYLAND_DISPLAY', 'wayland-2')}.sock"
+)
+FEEDBACK_DIR = "/tmp/hier-feedback-session"
+
+def send_cmd(cmd: str) -> str:
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(0.3)
+        s.connect(SOCKET_PATH)
+        s.sendall((cmd + "\n").encode())
+        res = ""
+        while True:
+            try:
+                chunk = s.recv(4096).decode()
+                if not chunk:
+                    break
+                res += chunk
+            except socket.timeout:
+                break
+        s.close()
+        return res
+    except Exception as e:
+        return f"error: failed to connect to control socket: {e}\n"
+
+def main():
+    print("==================================================")
+    print("      Hier User Feedback Telemetry Diagnostics    ")
+    print("==================================================")
+    
+    # 1. Create temporary directory
+    if not os.path.exists(FEEDBACK_DIR):
+        os.makedirs(FEEDBACK_DIR)
+        
+    print(f"[*] Created temporary collection directory: {FEEDBACK_DIR}")
+
+    # 2. Query Layout
+    print("[*] Querying compositor layout...")
+    layout_data = send_cmd("get_layout")
+    layout_file = os.path.join(FEEDBACK_DIR, "layout.json")
+    with open(layout_file, "w") as f:
+        f.write(layout_data)
+    
+    # 3. Query Windows
+    print("[*] Querying active window properties...")
+    windows_data = send_cmd("get_windows")
+    windows_file = os.path.join(FEEDBACK_DIR, "windows.json")
+    with open(windows_file, "w") as f:
+        f.write(windows_data)
+
+    # 4. Fetch Systemd User Journal Logs
+    print("[*] Capturing recent compositor systemd service logs...")
+    log_file = os.path.join(FEEDBACK_DIR, "hier.log")
+    try:
+        journal_output = subprocess.check_output(
+            ["journalctl", "--user", "-u", "hier.service", "-n", "150", "--no-pager"],
+            stderr=subprocess.STDOUT
+        ).decode()
+        with open(log_file, "w") as f:
+            f.write(journal_output)
+    except Exception as e:
+        with open(log_file, "w") as f:
+            f.write(f"Failed to query journalctl: {e}\n")
+        print("[!] Warning: Could not fetch systemd logs.")
+
+    # 5. Gather System Metadata
+    print("[*] Gathering system environment and hardware metadata...")
+    meta_file = os.path.join(FEEDBACK_DIR, "metadata.json")
+    metadata = {
+        "timestamp": time.time(),
+        "datetime": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+        "kernel": os.uname().release,
+        "machine": os.uname().machine,
+        "env": {
+            "WAYLAND_DISPLAY": os.environ.get("WAYLAND_DISPLAY"),
+            "XDG_RUNTIME_DIR": os.environ.get("XDG_RUNTIME_DIR"),
+            "XDG_CURRENT_DESKTOP": os.environ.get("XDG_CURRENT_DESKTOP"),
+            "DISPLAY": os.environ.get("DISPLAY"),
+            "SHELL": os.environ.get("SHELL"),
+        }
+    }
+    with open(meta_file, "w") as f:
+        json.dump(metadata, f, indent=4)
+
+    # 6. Compress package
+    timestamp = int(time.time())
+    archive_name = f"/tmp/hier-feedback-{timestamp}.tar.gz"
+    print(f"[*] Packaging files into {archive_name}...")
+    
+    try:
+        with tarfile.open(archive_name, "w:gz") as tar:
+            for root, _, files in os.walk(FEEDBACK_DIR):
+                for file in files:
+                    full_path = os.path.join(root, file)
+                    arcname = os.path.relpath(full_path, FEEDBACK_DIR)
+                    tar.add(full_path, arcname=arcname)
+        print("✅ Success: Feedback archive generated successfully!")
+        print(f"Please provide this file: {archive_name}")
+    except Exception as e:
+        print(f"❌ Error: Packaging failed: {e}")
+        sys.exit(1)
+        
+    # Clean up temp directory
+    for file in os.listdir(FEEDBACK_DIR):
+        os.remove(os.path.join(FEEDBACK_DIR, file))
+    os.rmdir(FEEDBACK_DIR)
+
+if __name__ == "__main__":
+    main()

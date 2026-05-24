@@ -1,0 +1,12 @@
+[package]
+name = "hier"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+smithay = { version = "0.7.0", features = ["backend_winit", "renderer_gl"] }
+wayland-server = "0.31"
+calloop = "0.14"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
