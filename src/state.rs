@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use smithay::{
     delegate_compositor, delegate_shm, delegate_seat, delegate_xdg_shell, delegate_output,
+    delegate_data_device, delegate_primary_selection, delegate_xdg_activation,
     desktop::{Space, Window, WindowSurfaceType},
     input::{
         Seat, SeatState, SeatHandler,
@@ -15,6 +16,12 @@ use smithay::{
     wayland::shell::xdg::{XdgShellState, XdgShellHandler, ToplevelSurface, PopupSurface, PositionerState},
     reexports::wayland_server::{DisplayHandle, Client, protocol::wl_surface::WlSurface},
     utils::{Serial, SERIAL_COUNTER, Point},
+    wayland::selection::{
+        SelectionHandler,
+        data_device::{DataDeviceState, DataDeviceHandler, ClientDndGrabHandler, ServerDndGrabHandler},
+        primary_selection::{PrimarySelectionState, PrimarySelectionHandler},
+    },
+    wayland::xdg_activation::{XdgActivationState, XdgActivationHandler},
 };
 use smithay::reexports::wayland_server::protocol::wl_seat::WlSeat;
 use smithay::backend::winit::WinitInput;
@@ -47,6 +54,9 @@ pub struct State {
     pub seat_state: SeatState<Self>,
     pub xdg_shell_state: XdgShellState,
     pub seat: Seat<Self>,
+    pub data_device_state: DataDeviceState,
+    pub primary_selection_state: PrimarySelectionState,
+    pub activation_state: XdgActivationState,
     pub running: bool,
     pub socket_name: String,
     pub highlighted_window: Option<(WindowId, [f32; 4])>,
@@ -60,6 +70,9 @@ impl State {
         let mut seat_state = SeatState::new();
         let mut seat = seat_state.new_wl_seat(&display_handle, "hier-seat");
         let xdg_shell_state = XdgShellState::new::<Self>(&display_handle);
+        let data_device_state = DataDeviceState::new::<Self>(&display_handle);
+        let primary_selection_state = PrimarySelectionState::new::<Self>(&display_handle);
+        let activation_state = XdgActivationState::new::<Self>(&display_handle);
 
         // Add keyboard and pointer capabilities to the seat
         seat.add_keyboard(Default::default(), 200, 25).unwrap();
@@ -77,6 +90,9 @@ impl State {
             seat_state,
             xdg_shell_state,
             seat,
+            data_device_state,
+            primary_selection_state,
+            activation_state,
             running: true,
             socket_name,
             highlighted_window: None,
@@ -1311,3 +1327,44 @@ delegate_shm!(State);
 delegate_seat!(State);
 delegate_xdg_shell!(State);
 delegate_output!(State);
+
+// 7. Selection and Data Device Handlers
+impl SelectionHandler for State {
+    type SelectionUserData = ();
+}
+
+impl ClientDndGrabHandler for State {}
+impl ServerDndGrabHandler for State {}
+
+impl DataDeviceHandler for State {
+    fn data_device_state(&self) -> &DataDeviceState {
+        &self.data_device_state
+    }
+}
+
+// 8. Primary Selection Handler
+impl PrimarySelectionHandler for State {
+    fn primary_selection_state(&self) -> &PrimarySelectionState {
+        &self.primary_selection_state
+    }
+}
+
+// 9. XDG Activation Handler
+impl XdgActivationHandler for State {
+    fn activation_state(&mut self) -> &mut XdgActivationState {
+        &mut self.activation_state
+    }
+
+    fn request_activation(
+        &mut self,
+        _token: smithay::wayland::xdg_activation::XdgActivationToken,
+        _token_data: smithay::wayland::xdg_activation::XdgActivationTokenData,
+        surface: WlSurface,
+    ) {
+        self.set_keyboard_focus(Some(surface));
+    }
+}
+
+delegate_data_device!(State);
+delegate_primary_selection!(State);
+delegate_xdg_activation!(State);
