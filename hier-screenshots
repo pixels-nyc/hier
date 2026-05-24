@@ -253,6 +253,88 @@ def parse_window_rects(layout_str):
             continue
     return rects
 
+def focus_window_by_id(socket_path, target_win_id):
+    for attempt in range(10):
+        layout = send_cmd(socket_path, "get_layout_compact")
+        target_col = None
+        focused_col = None
+        
+        for line in layout.strip().split("\n"):
+            if not line or line.startswith("error:"):
+                continue
+            parts = line.split(":", 5)
+            if len(parts) < 4:
+                continue
+            try:
+                col_idx = int(parts[1])
+                win_id = int(parts[2])
+                is_focused = parts[3].lower() == "true"
+                
+                if win_id == target_win_id:
+                    target_col = col_idx
+                if is_focused:
+                    focused_col = col_idx
+            except ValueError:
+                continue
+                
+        if target_col is None:
+            print(f"⚠️ Warning: Target window {target_win_id} not found in layout.")
+            return False
+            
+        # Build list of windows in target column to check tab stack focus
+        lines = layout.strip().split("\n")
+        windows_in_target_col = []
+        focused_win_in_target_col_id = None
+        for line in lines:
+            if not line or line.startswith("error:"):
+                continue
+            parts = line.split(":", 5)
+            if len(parts) < 4:
+                continue
+            try:
+                col_idx = int(parts[1])
+                win_id = int(parts[2])
+                is_focused = parts[3].lower() == "true"
+                if col_idx == target_col:
+                    windows_in_target_col.append(win_id)
+                    if is_focused:
+                        focused_win_in_target_col_id = win_id
+            except ValueError:
+                continue
+                
+        if focused_col is None:
+            time.sleep(0.2)
+            continue
+            
+        if target_col != focused_col:
+            if target_col < focused_col:
+                print(f"[*] Moving focus left from col {focused_col} to col {target_col}...")
+                send_cmd(socket_path, "action focus-left")
+            else:
+                print(f"[*] Moving focus right from col {focused_col} to col {target_col}...")
+                send_cmd(socket_path, "action focus-right")
+            time.sleep(0.5)
+            continue
+            
+        if focused_win_in_target_col_id == target_win_id:
+            return True
+            
+        try:
+            target_idx = windows_in_target_col.index(target_win_id)
+            focused_idx = windows_in_target_col.index(focused_win_in_target_col_id)
+            if target_idx < focused_idx:
+                print(f"[*] Moving focus up in tab stack from window {focused_win_in_target_col_id} to {target_win_id}...")
+                send_cmd(socket_path, "action focus-up")
+            else:
+                print(f"[*] Moving focus down in tab stack from window {focused_win_in_target_col_id} to {target_win_id}...")
+                send_cmd(socket_path, "action focus-down")
+        except ValueError:
+            print("⚠️ Error calculating tab stack indices.")
+            return False
+            
+        time.sleep(0.5)
+    return False
+
 def main():
     captures_dir = "/home/super/.gemini/antigravity/brain/f93f86a1-b0d6-49ce-b82f-d76376c60ee0/captures"
     os.makedirs(captures_dir, exist_ok=True)
@@ -356,13 +438,22 @@ def main():
     for win_id, name in [(1, "capture_wayland-3_win_1.png"), 
                          (2, "capture_wayland-3_win_2.png"), 
                          (3, "capture_wayland-3_win_3.png")]:
-        rect = rects_n1.get(win_id)
+        print(f"[*] Focusing Window {win_id} inside Nest 1...")
+        focused = focus_window_by_id(socket1, win_id)
+        if not focused:
+            print(f"⚠️ Warning: Failed to focus window {win_id} inside Nest 1.")
+        time.sleep(1.0)
+
+        # Query Nest 1 layout to get centered coordinates after focusing
+        layout_n1_current = send_cmd(socket1, "get_layout_compact")
+        rects_n1_current = parse_window_rects(layout_n1_current)
+        rect = rects_n1_current.get(win_id)
         if rect:
             x1, y1, w1, h1 = rect
             cx = ox + x0 + x1
             cy = oy + y0 + y1
             img_client = os.path.join(captures_dir, name)
-            print(f"[*] Capturing Client {win_id}: grim -g \"{cx},{cy} {w1}x{h1}\" -> {name}")
+            print(f"[*] Capturing Client {win_id} (focused, relative x={x1}): grim -g \"{cx},{cy} {w1}x{h1}\" -> {name}")
             subprocess.run(["grim", "-g", f"{cx},{cy} {w1}x{h1}", img_client], check=True)
             
             if win_id == 2:
@@ -370,7 +461,7 @@ def main():
             elif win_id == 3:
                 shutil.copy(img_client, os.path.join(captures_dir, "capture_wayland-2_win_3.png"))
         else:
-            print(f"⚠️ Warning: Client window {win_id} not found in Nest 1 layout.")
+            print(f"⚠️ Warning: Client window {win_id} not found in Nest 1 layout after focus.")
 
     # 3. Capture demo_highlight.png
     print("[*] Highlighting Window 1 in Nest 1...")
