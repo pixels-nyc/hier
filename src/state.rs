@@ -1649,7 +1649,7 @@ impl XdgShellHandler for State {
         self.next_window_id += 1;
 
         // Configure initial size based on layout engine viewport and columns
-        let is_occupied = !self.layout_engine.active_workspace().columns.is_empty();
+        let is_occupied = self.layout_engine.active_workspace().has_tiled_columns();
         let win_width = if is_occupied {
             self.layout_engine.default_width_fraction * (self.layout_engine.viewport.width - 2.0 * self.layout_engine.outer_margin - self.layout_engine.gap)
         } else {

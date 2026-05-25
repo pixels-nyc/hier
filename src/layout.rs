@@ -40,6 +40,14 @@ impl Column {
     pub fn is_tabbed(&self) -> bool {
         self.windows.len() > 1
     }
+
+    /// Returns true if this column contains only overlay windows (like fuzzel/launchers).
+    pub fn is_overlay(&self) -> bool {
+        !self.windows.is_empty() && self.windows.iter().all(|w| {
+            let t = w.title.to_lowercase();
+            t.contains("fuzzel") || t.contains("launcher") || t.contains("menu") || t.contains("overlay")
+        })
+    }
 }
 
 /// A Workspace represented as an infinite horizontal strip of columns.
@@ -79,6 +87,11 @@ impl Workspace {
             }
         }
         None
+    }
+
+    /// Returns true if this workspace has any non-overlay tiled columns.
+    pub fn has_tiled_columns(&self) -> bool {
+        self.columns.iter().any(|col| !col.is_overlay())
     }
 }
 
@@ -237,18 +250,26 @@ impl LayoutEngine {
                 TilingMode::Diagonal => {
                     let mut current_x = self.outer_margin;
                     for (i, col) in workspace.columns.iter().enumerate() {
-                        // Diagonal offset based on column index
-                        let diag_offset = i as f32 * self.gap;
-                        positions.push(current_x + diag_offset);
-                        current_x += col.width + self.gap;
+                        if col.is_overlay() {
+                            positions.push(current_x);
+                        } else {
+                            // Diagonal offset based on column index
+                            let diag_offset = i as f32 * self.gap;
+                            positions.push(current_x + diag_offset);
+                            current_x += col.width + self.gap;
+                        }
                     }
                 }
                 TilingMode::Grid | TilingMode::Overview => {
                     // Simple left‑to‑right layout (current behavior)
                     let mut current_x = self.outer_margin;
                     for col in &workspace.columns {
-                        positions.push(current_x);
-                        current_x += col.width + self.gap;
+                        if col.is_overlay() {
+                            positions.push(current_x);
+                        } else {
+                            positions.push(current_x);
+                            current_x += col.width + self.gap;
+                        }
                     }
                 }
                 TilingMode::Float => {
@@ -397,35 +418,47 @@ impl LayoutEngine {
             return;
         }
 
-        if workspace.columns.len() == 1 {
+        let tiled_count = workspace.columns.iter().filter(|c| !c.is_overlay()).count();
+        if tiled_count <= 1 {
             self.viewport.target_x = 0.0;
             if immediate {
                 self.viewport.x = 0.0;
                 self.viewport.velocity_x = 0.0;
             }
         } else {
-            let last_idx = workspace.columns.len() - 1;
-            let last_col_x = positions[last_idx];
-            let last_col_w = workspace.columns[last_idx].width;
-            let total_width = last_col_x + last_col_w + self.outer_margin;
+            let last_tiled_idx = workspace.columns.iter().rposition(|c| !c.is_overlay());
+            if let Some(last_idx) = last_tiled_idx {
+                let last_col_x = positions[last_idx];
+                let last_col_w = workspace.columns[last_idx].width;
+                let total_width = last_col_x + last_col_w + self.outer_margin;
 
-            if total_width <= self.viewport.width {
+                if total_width <= self.viewport.width {
+                    self.viewport.target_x = 0.0;
+                    if immediate {
+                        self.viewport.x = 0.0;
+                        self.viewport.velocity_x = 0.0;
+                    }
+                } else {
+                    let col_idx = workspace.focused_column_idx;
+                    // Overlay columns are centered in the viewport, so they don't scroll camera
+                    if !workspace.columns[col_idx].is_overlay() {
+                        let col_x = positions[col_idx];
+                        let col_w = workspace.columns[col_idx].width;
+
+                        // Center the active column in the viewport
+                        let target_x = col_x + (col_w / 2.0) - (self.viewport.width / 2.0);
+                        self.viewport.target_x = target_x;
+
+                        if immediate {
+                            self.viewport.x = target_x;
+                            self.viewport.velocity_x = 0.0;
+                        }
+                    }
+                }
+            } else {
                 self.viewport.target_x = 0.0;
                 if immediate {
                     self.viewport.x = 0.0;
-                    self.viewport.velocity_x = 0.0;
-                }
-            } else {
-                let col_idx = workspace.focused_column_idx;
-                let col_x = positions[col_idx];
-                let col_w = workspace.columns[col_idx].width;
-
-                // Center the active column in the viewport
-                let target_x = col_x + (col_w / 2.0) - (self.viewport.width / 2.0);
-                self.viewport.target_x = target_x;
-
-                if immediate {
-                    self.viewport.x = target_x;
                     self.viewport.velocity_x = 0.0;
                 }
             }
@@ -697,11 +730,32 @@ impl LayoutEngine {
     pub fn get_window_rect(&self, id: WindowId) -> Option<(f32, f32, f32, f32)> {
         for (ws_idx, ws) in self.workspaces.iter().enumerate() {
             if let Some((col_idx, _win_idx)) = ws.find_window(id) {
+                // Check if it's an overlay window
+                let col = &ws.columns[col_idx];
+                let is_overlay = col.is_overlay();
+
+                if is_overlay {
+                    let w = 500.0f32.min(self.viewport.width - 40.0);
+                    let h = 400.0f32.min(self.viewport.height - 40.0);
+                    let x = (self.viewport.width - w) / 2.0;
+
+                    let y = if self.tiling_mode == TilingMode::Overview {
+                        let scale = 0.45_f32;
+                        let spacing = 40.0_f32;
+                        (ws_idx as f32 * (self.viewport.height + spacing / scale)) + (self.viewport.height - h) / 2.0
+                    } else {
+                        let ws_y = ws_idx as f32 * self.viewport.height;
+                        ws_y + (self.viewport.height - h) / 2.0
+                    };
+                    return Some((x, y, w, h));
+                }
+
                 if self.tiling_mode == TilingMode::Overview {
                     let scale = 0.45_f32;
                     let spacing = 40.0_f32;
                     
-                    let (base_x, base_y, base_w, base_h) = if ws.columns.len() == 1 {
+                    let tiled_count = ws.columns.iter().filter(|c| !c.is_overlay()).count();
+                    let (base_x, base_y, base_w, base_h) = if tiled_count == 1 {
                         (
                             self.outer_margin,
                             self.outer_margin,
@@ -739,7 +793,8 @@ impl LayoutEngine {
 
                 let ws_y = ws_idx as f32 * self.viewport.height;
 
-                if ws.columns.len() == 1 {
+                let tiled_count = ws.columns.iter().filter(|c| !c.is_overlay()).count();
+                if tiled_count == 1 {
                     let x = self.outer_margin;
                     let y = ws_y + self.outer_margin;
                     let w = self.viewport.width - 2.0 * self.outer_margin;
