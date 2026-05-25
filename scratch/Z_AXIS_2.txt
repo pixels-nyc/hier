@@ -1,0 +1,12 @@
+================================================================================
+                           POSITION: Z AXIS 2
+================================================================================
+
+This client window represents Z AXIS 2 in the nesting and scrolling sequence.
+
+Role & Position:
+- In Depth Mode card carousel: Represents the secondary (index 1) card stack layer.
+- Evaluates Z-scroll wrapping limits.
+- Swiping/scrolling backward transfers focus back to Z AXIS 1.
+
+================================================================================

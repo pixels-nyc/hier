@@ -129,7 +129,7 @@ pub fn run_winit_compositor() -> Result<(), Box<dyn std::error::Error>> {
         size.width as f32,
         size.height as f32,
         10.0, // gap
-        20.0, // outer margin
+        0.0,  // outer margin
         5,    // workspaces
     );
 
@@ -178,6 +178,15 @@ pub fn run_winit_compositor() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|_| format!("/tmp/hier-ctrl-{}.sock", socket_name));
     let _ = std::fs::remove_file(&ctrl_socket_path);
     let ctrl_listener = std::os::unix::net::UnixListener::bind(&ctrl_socket_path)?;
+    
+    // Restrict socket file permissions to owner-only read/write (0o600) to prevent unauthorized access by other local users
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(metadata) = std::fs::metadata(&ctrl_socket_path) {
+        let mut perms = metadata.permissions();
+        perms.set_mode(0o600);
+        let _ = std::fs::set_permissions(&ctrl_socket_path, perms);
+    }
+    
     ctrl_listener.set_nonblocking(true)?;
 
     println!("--------------------------------------------------");
@@ -325,7 +334,43 @@ pub fn run_winit_compositor() -> Result<(), Box<dyn std::error::Error>> {
 
                     // 1. Add borders first to draw on top of windows (since front-to-back index 0 is front)
                     if let Some((win_id, color_arr)) = state.highlighted_window {
-                        if let Some((x, y, w, h)) = state.layout_engine.get_window_rect(win_id) {
+                        let current_scale = state.layout_engine.current_overview_scale;
+                        let is_scaled = state.layout_engine.tiling_mode == crate::layout::TilingMode::Overview
+                            || (current_scale - 1.0).abs() > 1e-3;
+                        
+                        let rect = if is_scaled {
+                            let t = ((1.0 - current_scale) / 0.55).clamp(0.0, 1.0);
+                            let rect_normal = state.layout_engine.get_window_rect_for_mode(win_id, &state.layout_engine.underlying_tiling_mode);
+                            let rect_overview = state.layout_engine.get_window_rect_for_mode(win_id, &crate::layout::TilingMode::Overview);
+                            if let (Some((nx, ny, nw, nh)), Some((ox, oy, ow, oh))) = (rect_normal, rect_overview) {
+                                let x = nx + (ox - nx) * t;
+                                let y = ny + (oy - ny) * t;
+                                let w = nw + (ow - nw) * t;
+                                let h = nh + (oh - nh) * t;
+                                Some((x * current_scale, y * current_scale, w * current_scale, h * current_scale))
+                            } else {
+                                None
+                            }
+                        } else if state.layout_engine.tiling_mode == crate::layout::TilingMode::Depth {
+                            let transforms = state.layout_engine.depth_transforms();
+                            if let Some((_, transform)) = transforms.iter().find(|(w_id, _)| *w_id == win_id) {
+                                if let Some((x, y, w, h)) = state.layout_engine.get_window_rect(win_id) {
+                                    let scaled_w = w * transform.scale;
+                                    let scaled_h = h * transform.scale;
+                                    let x_offset = (w - scaled_w) / 2.0;
+                                    let y_offset = (h - scaled_h) / 2.0 + (transform.y_offset as f32);
+                                    Some((x + x_offset, y + y_offset, scaled_w, scaled_h))
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        } else {
+                            state.layout_engine.get_window_rect(win_id)
+                        };
+
+                        if let Some((x, y, w, h)) = rect {
                             let color = smithay::backend::renderer::Color32F::from(color_arr);
                             let border_thickness = 4;
                             let scale_factor = state.output.current_scale().fractional_scale();
@@ -414,47 +459,66 @@ pub fn run_winit_compositor() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             }
                         }
-                    } else if state.layout_engine.tiling_mode == crate::layout::TilingMode::Overview {
-                        let scale = 0.45_f32;
+                    } else if state.layout_engine.tiling_mode == crate::layout::TilingMode::Overview
+                        || (state.layout_engine.current_overview_scale - 1.0).abs() > 1e-3
+                    {
+                        let current_scale = state.layout_engine.current_overview_scale;
+                        // t goes from 0.0 (current_scale = 1.0) to 1.0 (current_scale = 0.45)
+                        let t = ((1.0 - current_scale) / 0.55).clamp(0.0, 1.0);
                         let spacing = 40.0_f32;
                         let scale_factor = state.output.current_scale().fractional_scale();
-                        let line_color = smithay::backend::renderer::Color32F::from([0.3f32, 0.3f32, 0.3f32, 1.0f32]);
-                        
+                        let line_opacity = (1.0 - (current_scale - 0.45) / 0.55).clamp(0.0, 1.0);
+
                         use smithay::backend::renderer::element::solid::SolidColorRenderElement;
                         use smithay::utils::{Rectangle, Point, Size};
                         use smithay::backend::renderer::element::Kind;
                         use smithay::backend::renderer::utils::CommitCounter;
 
-                        // 1. Draw workspace separator lines
-                        for ws_idx in 0..state.layout_engine.workspaces.len().saturating_sub(1) {
-                            let y_start = ws_idx as f32 * (state.layout_engine.viewport.height * scale + spacing);
-                            let y_line = y_start + state.layout_engine.viewport.height * scale + (spacing / 2.0);
-                            
-                            let px = 0;
-                            let py = ((y_line - state.layout_engine.viewport.y) as f64 * scale_factor) as i32;
-                            let pw = (state.layout_engine.viewport.width as f64 * scale_factor) as i32;
-                            let ph = (2.0f64 * scale_factor) as i32;
-                            
-                            let id_line = smithay::backend::renderer::element::Id::new();
-                            render_elements.push(MyRenderElement::Solid(SolidColorRenderElement::new(
-                                id_line,
-                                Rectangle::new(Point::from((px, py)), Size::from((pw, ph))),
-                                CommitCounter::default(),
-                                line_color,
-                                Kind::Unspecified,
-                            )));
+                        // 1. Draw workspace separator lines if visible
+                        if line_opacity > 0.0 {
+                            let line_color = smithay::backend::renderer::Color32F::from([0.3f32, 0.3f32, 0.3f32, line_opacity]);
+                            for ws_idx in 0..state.layout_engine.workspaces.len().saturating_sub(1) {
+                                // Draw at target overview layout positioning
+                                let y_start = ws_idx as f32 * (state.layout_engine.viewport.height * 0.45 + spacing);
+                                let y_line = y_start + state.layout_engine.viewport.height * 0.45 + (spacing / 2.0);
+                                
+                                let px = 0;
+                                let py = ((y_line - state.layout_engine.viewport.y) as f64 * scale_factor) as i32;
+                                let pw = (state.layout_engine.viewport.width as f64 * scale_factor) as i32;
+                                let ph = (2.0f64 * scale_factor) as i32;
+                                
+                                let id_line = smithay::backend::renderer::element::Id::new();
+                                render_elements.push(MyRenderElement::Solid(SolidColorRenderElement::new(
+                                    id_line,
+                                    Rectangle::new(Point::from((px, py)), Size::from((pw, ph))),
+                                    CommitCounter::default(),
+                                    line_color,
+                                    Kind::Unspecified,
+                                )));
+                            }
                         }
 
-                        // 2. Draw scaled windows
+                        // 2. Draw scaled windows with interpolated bounds
                         for (&win_id, smithay_win) in &state.windows {
-                            if let Some((x, y, _w, _h)) = state.layout_engine.get_window_rect(win_id) {
-                                let sx = x * scale;
-                                let sy = y * scale;
+                            let rect_normal = state.layout_engine.get_window_rect_for_mode(win_id, &state.layout_engine.underlying_tiling_mode);
+                            let rect_overview = state.layout_engine.get_window_rect_for_mode(win_id, &crate::layout::TilingMode::Overview);
+                            
+                            if let (Some((nx, ny, nw, nh)), Some((ox, oy, ow, oh))) = (rect_normal, rect_overview) {
+                                // Interpolate logical bounds
+                                let x = nx + (ox - nx) * t;
+                                let y = ny + (oy - ny) * t;
+                                let w = nw + (ow - nw) * t;
+                                let h = nh + (oh - nh) * t;
+                                
+                                // Render scaled at compositor level
+                                let sx = x * current_scale;
+                                let sy = y * current_scale;
+                                
                                 let px = ((sx - state.layout_engine.viewport.x) as f64 * scale_factor) as i32;
                                 let py = ((sy - state.layout_engine.viewport.y) as f64 * scale_factor) as i32;
                                 
                                 let location = smithay::utils::Point::from((px, py));
-                                let scale_val = smithay::utils::Scale::from(scale_factor * scale as f64);
+                                let scale_val = smithay::utils::Scale::from(scale_factor * current_scale as f64);
                                 
                                 use smithay::backend::renderer::element::AsRenderElements;
                                 let elems: Vec<MyRenderElement> = AsRenderElements::render_elements(
@@ -484,9 +548,8 @@ pub fn run_winit_compositor() -> Result<(), Box<dyn std::error::Error>> {
                 };
                 backend.submit(damage.damage.map(|v| v.as_slice())).unwrap();
 
-                let time = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default();
+                let time = state.start_time.elapsed();
+
 
                 state.space.elements().for_each(|window| {
                     window.send_frame(

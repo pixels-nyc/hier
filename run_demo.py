@@ -67,12 +67,24 @@ def ppm_to_png(ppm_path, png_path):
         
     save_png(width, height, pixel_bytes, png_path)
 
-def get_terminal_cmd():
+def get_terminal_cmd(role="GENERIC"):
     import shutil
-    for term in ["foot", "alacritty", "kitty", "xterm"]:
-        if shutil.which(term):
-            return [term]
-    return ["alacritty"]
+    term = "foot"
+    if not shutil.which(term):
+        term = "alacritty"
+        if not shutil.which(term):
+            term = "xterm"
+            
+    info_file = f"/home/super/Work/rust-based-dev/niri-rebuild/scratch/{role}.txt"
+    if not os.path.exists(info_file):
+        info_file = "/home/super/Work/rust-based-dev/niri-rebuild/scratch/GENERIC.txt"
+        
+    if term == "foot":
+        return ["foot", "sh", "-c", f"cat {info_file}; exec $SHELL"]
+    elif term == "alacritty":
+        return ["alacritty", "-e", "sh", "-c", f"cat {info_file}; exec $SHELL"]
+    else:
+        return [term, "-e", "sh", "-c", f"cat {info_file}; exec $SHELL"]
 
 def send_cmd(socket_path: str, cmd: str) -> str:
     try:
@@ -268,14 +280,14 @@ def main():
     time.sleep(2.0)
 
     # 3. Spawning multiple programs inside Nest 1
-    term_cmd = get_terminal_cmd()
-    print(f"[*] Spawning 3 client terminals ({term_cmd[0]}) inside Nest 1 (display {display1})...")
+    print(f"[*] Spawning 3 client terminals inside Nest 1 (display {display1})...")
     env_clients = os.environ.copy()
     env_clients["WAYLAND_DISPLAY"] = display1
     env_clients["LIBGL_ALWAYS_SOFTWARE"] = "1"
     
     clients = []
     for i in range(3):
+        term_cmd = get_terminal_cmd(f"WINDOW_{i+1}")
         p = subprocess.Popen(term_cmd, env=env_clients)
         clients.append(p)
         time.sleep(2.0)
@@ -401,10 +413,10 @@ def main():
     print(f"[*] Nest 1 Layout after closing clients:\n{layout_cleared.strip()}")
 
     # Respawn terminal clients
-    term_cmd = get_terminal_cmd()
-    print(f"[*] Respawning client windows ({term_cmd[0]}) inside Nest 1...")
+    print("[*] Respawning client windows inside Nest 1...")
     new_clients = []
     for i in range(3):
+        term_cmd = get_terminal_cmd(f"WINDOW_{i+1}")
         p = subprocess.Popen(term_cmd, env=env_clients)
         new_clients.append(p)
         time.sleep(2.0)

@@ -1,0 +1,48 @@
+================================================================================
+                    HIER NESTED COMPOSITOR TEST SUITE
+                        TERMINAL CLIENT LAUNCH INFO
+================================================================================
+
+This terminal instance represents a mock client window spawned inside the 
+hier Wayland nested compositor test environment. The test suite evaluates 
+compositor-level coordinates, layout modes, scroll wrapping, and camera snaps.
+
+--------------------------------------------------------------------------------
+                     LAYOUT & TRANSITION LEVEL KEY CONCEPTS
+--------------------------------------------------------------------------------
+
+[ Z AXIS 1 & Z AXIS 2 ]
+  - Depth mode cards are stacked along the virtual Z-axis.
+  - Active focused window is positioned at the front (scale 1.0, opacity 1.0).
+  - Background windows are scaled down (e.g., 0.8, 0.6) and faded.
+  - Alt+Tab / Logo switcher Z-scroll cycles windows dynamically.
+  - Wrapped focus allows seamless continuous rotation from Z AXIS 2 back to 1.
+
+[ FULLSCREEN ]
+  - Clients requesting fullscreen bypass tiling.
+  - The compositor centers and resizes the client to cover the output viewport.
+  - Camera viewport is locked or panned accordingly.
+
+[ HALF SIZE ]
+  - Under Grid or Diagonal tiling modes, new columns default to half size.
+  - Gaps (default 10px) and margins (default 20px) are calculated to fill width.
+
+[ WINDOW 1, WINDOW 2, & WINDOW 3 ]
+  - Represent columns or tabs in a stacked tab group.
+  - Window 1: Left column or bottom/background tab.
+  - Window 2: Middle column or focused foreground tab.
+  - Window 3: Right column.
+
+[ WORKSPACER ]
+  - Displays workspaces as distinct rows spaced Vertically.
+  - Overview Mode scales the entire Workspacer layer down to 0.45 size.
+  - Workspace switchers slide coordinates vertically to target viewports.
+
+================================================================================
+              ACTIVE COMPOSITOR TELEMETRY DIAGNOSTIC INFORMATION
+================================================================================
+Compositor Socket: /tmp/hier-ctrl-wayland-X.sock
+Tiling Modes     : Diagonal | Grid | Float | Depth | Overview
+Visual Highlights: Active borders [30, 144, 255] (Deep Sky Blue)
+Physics Engines  : Converging spring physics (Stiffness=170.0, Damping=26.0)
+================================================================================

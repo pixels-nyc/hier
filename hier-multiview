@@ -107,9 +107,16 @@ def parse_layout(layout_str: str):
         })
     return workspaces
 
-def render_display_tree(display_name: str, workspaces: dict):
+def render_display_tree(display_name: str, workspaces: dict, socket_path: str = None):
+    camera_info = ""
+    if socket_path and os.path.exists(socket_path):
+        cam_res = send_cmd(socket_path, "get_camera").strip()
+        if not cam_res.startswith("error:"):
+            parts = cam_res.split(",")
+            if len(parts) >= 7:
+                camera_info = f" | Tiling Mode: {parts[6]} | Viewport: ({float(parts[0]):.1f},{float(parts[1]):.1f}) -> ({float(parts[2]):.1f},{float(parts[3]):.1f})"
     print(f"==================================================")
-    print(f" DISPLAY: [{display_name}]")
+    print(f" DISPLAY: [{display_name}]{camera_info}")
     print(f"==================================================")
     
     if not workspaces:
@@ -152,8 +159,17 @@ def print_nest(display_name: str, workspaces: dict, child_map: dict, indent: str
     nest_prefix = "└── " if is_last else "├── "
     next_indent = indent + ("    " if is_last else "│   ")
     
+    socket_path = f"/tmp/hier-ctrl-{display_name}.sock"
+    camera_info = ""
+    if os.path.exists(socket_path):
+        cam_res = send_cmd(socket_path, "get_camera").strip()
+        if not cam_res.startswith("error:"):
+            parts = cam_res.split(",")
+            if len(parts) >= 7:
+                camera_info = f" ({parts[6]} Mode, Cam: {float(parts[0]):.1f},{float(parts[1]):.1f})"
+
     active_marker = " (Active Focus)" if os.environ.get("WAYLAND_DISPLAY") == display_name else ""
-    print(f"{indent}{nest_prefix}Nest [{display_name}]{active_marker}")
+    print(f"{indent}{nest_prefix}Nest [{display_name}]{active_marker}{camera_info}")
     
     has_child = display_name in child_map
     
@@ -224,92 +240,172 @@ def main():
         "--screenshot-dir", "-s",
         help="Directory to save window screenshots to."
     )
+    parser.add_argument(
+        "--interval", "-i",
+        type=float,
+        help="Run continuously, repeating inspection and screenshot capture at this interval (in seconds)."
+    )
+    parser.add_argument(
+        "--get-camera", "-c",
+        action="store_true",
+        help="Print raw camera telemetry for target display(s)."
+    )
+    parser.add_argument(
+        "--set-camera", "-C",
+        nargs="+",
+        help="Set camera viewport coordinates: X Y [immediate] (e.g. --set-camera 100 200 or --set-camera 0 0 true)"
+    )
+    parser.add_argument(
+        "--set-tiling",
+        choices=["diagonal", "grid", "float", "depth", "overview"],
+        help="Set tiling mode for target display(s)."
+    )
     
     args = parser.parse_args()
     
-    targets = []
-    if args.all or args.nest_mode:
-        # Scan /tmp/hier-ctrl-*.sock
-        pattern = "/tmp/hier-ctrl-wayland-*.sock"
-        for path in glob.glob(pattern):
-            match = re.search(r"hier-ctrl-(wayland-\d+)\.sock", path)
-            if match:
-                targets.append(match.group(1))
-        targets.sort()
+    import time
+    interval = args.interval
+    
+    while True:
+        targets = []
+        if args.all or args.nest_mode:
+            # Scan /tmp/hier-ctrl-*.sock
+            pattern = "/tmp/hier-ctrl-wayland-*.sock"
+            for path in glob.glob(pattern):
+                match = re.search(r"hier-ctrl-(wayland-\d+)\.sock", path)
+                if match:
+                    targets.append(match.group(1))
+            targets.sort()
+        else:
+            disp = args.display or os.environ.get("WAYLAND_DISPLAY")
+            if not disp:
+                print("❌ Error: No Wayland display specified. Run inside Nest(N) or specify --display / --all / --nest-mode.")
+                sys.exit(1)
+            targets.append(disp)
+            
         if not targets:
-            print("❌ No active hier control sockets found in /tmp.")
-            sys.exit(1)
-    else:
-        disp = args.display or os.environ.get("WAYLAND_DISPLAY")
-        if not disp:
-            print("❌ Error: No Wayland display specified. Run inside Nest(N) or specify --display / --all / --nest-mode.")
-            sys.exit(1)
-        targets.append(disp)
-        
-    if args.nest_mode:
-        # Build child relationships
-        child_map = {}
-        has_parent = set()
-        for disp in targets:
-            socket_path = f"/tmp/hier-ctrl-{disp}.sock"
-            if os.path.exists(socket_path):
-                child_res = send_cmd(socket_path, "get_child_display").strip()
-                if child_res and not child_res.startswith("error:") and child_res != "none":
-                    child_map[disp] = child_res
-                    has_parent.add(child_res)
-                    
-        roots = [t for t in targets if t not in has_parent]
-        if not roots:
-            roots = targets
-            
-        print("==================================================")
-        print("      NESTED COMPOSITOR MULTI-VIEW STATUS")
-        print("==================================================")
-        for idx, root in enumerate(roots):
-            socket_path = f"/tmp/hier-ctrl-{root}.sock"
-            workspaces = {}
-            if os.path.exists(socket_path):
-                layout_str = send_cmd(socket_path, "get_layout_compact")
-                if not layout_str.startswith("error:"):
-                    workspaces = parse_layout(layout_str)
-            
-            is_last = (idx == len(roots) - 1)
-            print_nest(root, workspaces, child_map, indent="", is_last=is_last)
-            
-    else:
-        for disp in targets:
-            socket_path = f"/tmp/hier-ctrl-{disp}.sock"
-            if not os.path.exists(socket_path):
-                print(f"⚠️ Warning: Control socket for display '{disp}' not found at: {socket_path}")
-                continue
-                
-            layout_str = send_cmd(socket_path, "get_layout_compact")
-            if layout_str.startswith("error:"):
-                print(f"❌ Failed to query layout for display '{disp}': {layout_str.strip()}")
-                continue
-                
-            workspaces = parse_layout(layout_str)
-            render_display_tree(disp, workspaces)
+            if not interval:
+                print("❌ No active hier control sockets found in /tmp.")
+                sys.exit(1)
+        else:
+            if args.set_tiling:
+                action_name = f"tiling-mode-{args.set_tiling}"
+                for disp in targets:
+                    socket_path = f"/tmp/hier-ctrl-{disp}.sock"
+                    if os.path.exists(socket_path):
+                        res = send_cmd(socket_path, f"action {action_name}")
+                        print(f"[*] Setting tiling mode of {disp} to {args.set_tiling}: {res.strip()}")
+                    else:
+                        print(f"❌ Socket not found for display: {disp}")
+                if not interval:
+                    sys.exit(0)
 
-            if args.screenshot_dir:
-                os.makedirs(args.screenshot_dir, exist_ok=True)
-                for ws_idx, cols in workspaces.items():
-                    for col_idx, wins in cols.items():
-                        for win in wins:
-                            win_id = win["id"]
-                            temp_ppm_path = os.path.join(args.screenshot_dir, f"capture_{disp}_win_{win_id}.ppm")
-                            png_path = os.path.join(args.screenshot_dir, f"capture_{disp}_win_{win_id}.png")
-                            print(f"[*] Capturing screenshot of Window {win_id} on display {disp}...")
-                            res = send_cmd(socket_path, f"capture_window {win_id} {temp_ppm_path}")
-                            if "error" in res.lower() or not os.path.exists(temp_ppm_path):
-                                print(f"  ❌ Failed to capture window {win_id}: {res.strip()}")
+            if args.set_camera:
+                if len(args.set_camera) < 2:
+                    print("❌ Error: --set-camera requires at least X and Y coordinates.")
+                    sys.exit(1)
+                x = args.set_camera[0]
+                y = args.set_camera[1]
+                immediate = "true" if (len(args.set_camera) > 2 and args.set_camera[2].lower() in ("true", "immediate", "1")) else "false"
+                for disp in targets:
+                    socket_path = f"/tmp/hier-ctrl-{disp}.sock"
+                    if os.path.exists(socket_path):
+                        res = send_cmd(socket_path, f"set_camera {x} {y} {immediate}")
+                        print(f"[*] Setting camera of {disp} to ({x}, {y}) [immediate={immediate}]: {res.strip()}")
+                    else:
+                        print(f"❌ Socket not found for display: {disp}")
+                if not interval:
+                    sys.exit(0)
+
+            if args.get_camera:
+                for disp in targets:
+                    socket_path = f"/tmp/hier-ctrl-{disp}.sock"
+                    if os.path.exists(socket_path):
+                        res = send_cmd(socket_path, "get_camera").strip()
+                        if not res.startswith("error:"):
+                            parts = res.split(",")
+                            if len(parts) >= 7:
+                                print(f"Display {disp} Camera:")
+                                print(f"  Current Position: ({float(parts[0]):.1f}, {float(parts[1]):.1f})")
+                                print(f"  Target Position:  ({float(parts[2]):.1f}, {float(parts[3]):.1f})")
+                                print(f"  Dimensions:       {parts[4]}x{parts[5]}")
+                                print(f"  Tiling Mode:      {parts[6]}")
                             else:
-                                try:
-                                    ppm_to_png(temp_ppm_path, png_path)
-                                    os.remove(temp_ppm_path)
-                                    print(f"  ✅ Saved screenshot to: {png_path}")
-                                except Exception as e:
-                                    print(f"  ❌ Failed to convert PPM to PNG for window {win_id}: {e}")
+                                print(f"Display {disp} Raw Camera: {res}")
+                        else:
+                            print(f"❌ Failed to get camera for {disp}: {res}")
+                    else:
+                        print(f"❌ Socket not found for display: {disp}")
+                if not interval:
+                    sys.exit(0)
+            if args.nest_mode:
+                # Build child relationships
+                child_map = {}
+                has_parent = set()
+                for disp in targets:
+                    socket_path = f"/tmp/hier-ctrl-{disp}.sock"
+                    if os.path.exists(socket_path):
+                        child_res = send_cmd(socket_path, "get_child_display").strip()
+                        if child_res and not child_res.startswith("error:") and child_res != "none":
+                            child_map[disp] = child_res
+                            has_parent.add(child_res)
+                            
+                roots = [t for t in targets if t not in has_parent]
+                if not roots:
+                    roots = targets
+                    
+                print("==================================================")
+                print("      NESTED COMPOSITOR MULTI-VIEW STATUS")
+                print("==================================================")
+                for idx, root in enumerate(roots):
+                    socket_path = f"/tmp/hier-ctrl-{root}.sock"
+                    workspaces = {}
+                    if os.path.exists(socket_path):
+                        layout_str = send_cmd(socket_path, "get_layout_compact")
+                        if not layout_str.startswith("error:"):
+                            workspaces = parse_layout(layout_str)
+                    
+                    is_last = (idx == len(roots) - 1)
+                    print_nest(root, workspaces, child_map, indent="", is_last=is_last)
+                    
+            else:
+                for disp in targets:
+                    socket_path = f"/tmp/hier-ctrl-{disp}.sock"
+                    if not os.path.exists(socket_path):
+                        print(f"⚠️ Warning: Control socket for display '{disp}' not found at: {socket_path}")
+                        continue
+                        
+                    layout_str = send_cmd(socket_path, "get_layout_compact")
+                    if layout_str.startswith("error:"):
+                        print(f"❌ Failed to query layout for display '{disp}': {layout_str.strip()}")
+                        continue
+                        
+                    workspaces = parse_layout(layout_str)
+                    render_display_tree(disp, workspaces, socket_path)
+        
+                    if args.screenshot_dir:
+                        os.makedirs(args.screenshot_dir, exist_ok=True)
+                        for ws_idx, cols in workspaces.items():
+                            for col_idx, wins in cols.items():
+                                for win in wins:
+                                    win_id = win["id"]
+                                    temp_ppm_path = os.path.join(args.screenshot_dir, f"capture_{disp}_win_{win_id}.ppm")
+                                    png_path = os.path.join(args.screenshot_dir, f"capture_{disp}_win_{win_id}.png")
+                                    print(f"[*] Capturing screenshot of Window {win_id} on display {disp}...")
+                                    res = send_cmd(socket_path, f"capture_window {win_id} {temp_ppm_path}")
+                                    if "error" in res.lower() or not os.path.exists(temp_ppm_path):
+                                        print(f"  ❌ Failed to capture window {win_id}: {res.strip()}")
+                                    else:
+                                        try:
+                                            ppm_to_png(temp_ppm_path, png_path)
+                                            os.remove(temp_ppm_path)
+                                            print(f"  ✅ Saved screenshot to: {png_path}")
+                                        except Exception as e:
+                                            print(f"  ❌ Failed to convert PPM to PNG for window {win_id}: {e}")
+        
+        if not interval:
+            break
+        time.sleep(interval)
 
 if __name__ == "__main__":
     main()

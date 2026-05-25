@@ -1,0 +1,12 @@
+================================================================================
+                          POSITION: WINDOW 3 (RIGHT)
+================================================================================
+
+This client window represents WINDOW 3 in the multi-column tiling layout.
+
+Role & Position:
+- In Grid / Diagonal tiling modes: Renders as the RIGHT column.
+- In Depth stacking mode: Acts as the top/foreground tab/card.
+- Evaluates workspace boundaries and column extension constraints.
+
+================================================================================

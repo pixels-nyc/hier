@@ -21,7 +21,11 @@ fi
 
 TARGET_CMD=("$@")
 if [ ${#TARGET_CMD[@]} -eq 0 ]; then
-  TARGET_CMD=("/usr/bin/alacritty")
+  if command -v foot >/dev/null 2>&1; then
+    TARGET_CMD=("/usr/bin/foot")
+  else
+    TARGET_CMD=("/usr/bin/alacritty")
+  fi
 fi
 
 BWRAP_ARGS=(
@@ -35,6 +39,7 @@ BWRAP_ARGS=(
   --proc /proc
   --tmpfs /tmp
   --tmpfs /home
+  --bind-try /dev/shm /dev/shm
   --bind "$SANDBOX_DIR" "$SANDBOX_DIR"
   --bind "$HOST_XDG_RUNTIME_DIR/$HOST_WAYLAND_DISPLAY" "$SANDBOX_DIR/$HOST_WAYLAND_DISPLAY"
   --setenv WAYLAND_DISPLAY "$HOST_WAYLAND_DISPLAY"
@@ -47,9 +52,9 @@ if [ "$SOFTWARE_MODE" -eq 1 ] || [ -n "$LIBGL_ALWAYS_SOFTWARE" ]; then
   echo "[Sandbox] Software rendering mode (llvmpipe) FORCED."
   BWRAP_ARGS+=(--setenv LIBGL_ALWAYS_SOFTWARE 1)
 else
-  echo "[Sandbox] Hardware GPU/DRI acceleration and Shared Memory enabled."
+  echo "[Sandbox] Hardware GPU/DRI acceleration enabled."
   echo "[Sandbox] Tip: If GPU driver errors occur inside sandbox (e.g. libEGL / VK_ERROR), restart with --software"
-  BWRAP_ARGS+=(--dev-bind-try /dev/dri /dev/dri --bind-try /dev/shm /dev/shm)
+  BWRAP_ARGS+=(--dev-bind-try /dev/dri /dev/dri)
 fi
 
 bwrap "${BWRAP_ARGS[@]}" "${TARGET_CMD[@]}"

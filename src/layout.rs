@@ -166,6 +166,10 @@ pub struct LayoutEngine {
     pub depth_scroll_progress: f32,
     /// Z-scroll sensitivity (determines how fast scroll_z progresses)
     pub scroll_sensitivity: f32,
+    pub current_overview_scale: f32,
+    pub target_overview_scale: f32,
+    pub overview_scale_velocity: f32,
+    pub underlying_tiling_mode: TilingMode,
 }
 
 impl LayoutEngine {
@@ -193,15 +197,19 @@ impl LayoutEngine {
             spring: Spring::default(),
             gap,
             outer_margin,
-            default_width_fraction: 0.5,
+            default_width_fraction: 1.0,
             tiling_mode: TilingMode::Grid,
             windows: Vec::new(),
             depth_scroll_progress: 0.0,
             scroll_sensitivity,
+            current_overview_scale: 1.0,
+            target_overview_scale: 1.0,
+            overview_scale_velocity: 0.0,
+            underlying_tiling_mode: TilingMode::Grid,
         }
     }
 
-    /// Ticks the spring physics for the camera positioning.
+    /// Ticks the spring physics for the camera positioning and workspace scaling.
     pub fn tick(&mut self, dt: f32) {
         let (nx, vx) = self.spring.update(
             self.viewport.x,
@@ -220,6 +228,15 @@ impl LayoutEngine {
         );
         self.viewport.y = ny;
         self.viewport.velocity_y = vy;
+
+        let (ns, vs) = self.spring.update(
+            self.current_overview_scale,
+            self.overview_scale_velocity,
+            self.target_overview_scale,
+            dt,
+        );
+        self.current_overview_scale = ns;
+        self.overview_scale_velocity = vs;
     }
 
     /// Resize the physical output dimensions.
@@ -244,9 +261,13 @@ impl LayoutEngine {
     /// The first column starts at `outer_margin`.
     /// Subsequent columns are placed dynamically based on the width of previous columns and gaps.
     pub fn column_positions(&self, workspace_idx: usize) -> Vec<f32> {
+        self.column_positions_for_mode(workspace_idx, &self.tiling_mode)
+    }
+
+    pub fn column_positions_for_mode(&self, workspace_idx: usize, mode: &TilingMode) -> Vec<f32> {
         let mut positions = Vec::new();
         if let Some(workspace) = self.workspaces.get(workspace_idx) {
-            match self.tiling_mode {
+            match *mode {
                 TilingMode::Diagonal => {
                     let mut current_x = self.outer_margin;
                     for (i, col) in workspace.columns.iter().enumerate() {
@@ -350,6 +371,16 @@ impl LayoutEngine {
 
     /// of the active workspace and the active workspace's vertical offset.
     pub fn recenter_camera(&mut self, immediate: bool) {
+        if self.tiling_mode == TilingMode::Overview {
+            self.target_overview_scale = 0.45;
+        } else {
+            self.target_overview_scale = 1.0;
+        }
+        if immediate {
+            self.current_overview_scale = self.target_overview_scale;
+            self.overview_scale_velocity = 0.0;
+        }
+
         let active_idx = self.active_workspace_idx;
         
         if self.tiling_mode == TilingMode::Overview {
@@ -728,6 +759,10 @@ impl LayoutEngine {
     }
 
     pub fn get_window_rect(&self, id: WindowId) -> Option<(f32, f32, f32, f32)> {
+        self.get_window_rect_for_mode(id, &self.tiling_mode)
+    }
+
+    pub fn get_window_rect_for_mode(&self, id: WindowId, mode: &TilingMode) -> Option<(f32, f32, f32, f32)> {
         for (ws_idx, ws) in self.workspaces.iter().enumerate() {
             if let Some((col_idx, _win_idx)) = ws.find_window(id) {
                 // Check if it's an overlay window
@@ -739,7 +774,7 @@ impl LayoutEngine {
                     let h = 400.0f32.min(self.viewport.height - 40.0);
                     let x = (self.viewport.width - w) / 2.0;
 
-                    let y = if self.tiling_mode == TilingMode::Overview {
+                    let y = if *mode == TilingMode::Overview {
                         let scale = 0.45_f32;
                         let spacing = 40.0_f32;
                         (ws_idx as f32 * (self.viewport.height + spacing / scale)) + (self.viewport.height - h) / 2.0
@@ -750,7 +785,7 @@ impl LayoutEngine {
                     return Some((x, y, w, h));
                 }
 
-                if self.tiling_mode == TilingMode::Overview {
+                if *mode == TilingMode::Overview {
                     let scale = 0.45_f32;
                     let spacing = 40.0_f32;
                     
@@ -763,7 +798,7 @@ impl LayoutEngine {
                             self.viewport.height - 2.0 * self.outer_margin,
                         )
                     } else {
-                        let positions = self.column_positions(ws_idx);
+                        let positions = self.column_positions_for_mode(ws_idx, mode);
                         let col_x = positions[col_idx];
                         let col = &ws.columns[col_idx];
                         let col_width = col.width;
@@ -782,7 +817,7 @@ impl LayoutEngine {
                     return Some((x, y, w, h));
                 }
 
-                if self.tiling_mode == TilingMode::Depth {
+                if *mode == TilingMode::Depth {
                     let ws_y = ws_idx as f32 * self.viewport.height;
                     let x = self.outer_margin;
                     let y = ws_y + self.outer_margin;
@@ -802,7 +837,7 @@ impl LayoutEngine {
                     return Some((x, y, w, h));
                 }
 
-                let positions = self.column_positions(ws_idx);
+                let positions = self.column_positions_for_mode(ws_idx, mode);
                 let col_x = positions[col_idx];
                 let col = &ws.columns[col_idx];
                 let col_width = col.width;
@@ -867,17 +902,17 @@ mod tests {
         // Col 2: 530.0 + 500.0 + 10.0 = 1040.0, width = 500.0
         let positions = engine.column_positions(0);
         assert_eq!(positions[0], 20.0);
-        assert_eq!(positions[1], 505.0);
-        assert_eq!(positions[2], 990.0);
+        assert_eq!(positions[1], 980.0);
+        assert_eq!(positions[2], 1940.0);
 
-        // Center on Col 2: target_x = 990.0 + 237.5 - 500.0 = 727.5
-        assert_eq!(engine.viewport.target_x, 727.5);
+        // Center on Col 2: target_x = 1940.0 + 475.0 - 500.0 = 1915.0
+        assert_eq!(engine.viewport.target_x, 1915.0);
 
         // Move left (to W2, index 1)
         engine.focus_left();
         assert_eq!(engine.active_workspace().focused_column_idx, 1);
-        // Center on Col 1: target_x = 505.0 + 237.5 - 500.0 = 242.5
-        assert_eq!(engine.viewport.target_x, 242.5);
+        // Center on Col 1: target_x = 980.0 + 475.0 - 500.0 = 955.0
+        assert_eq!(engine.viewport.target_x, 955.0);
     }
 
     #[test]
@@ -978,8 +1013,8 @@ mod tests {
         assert_eq!(active_ws.columns[1].windows[0].id, w1); // Terminal
 
         // 9. Verify camera target position centered on Column 0
-        // Because the columns fit within the viewport (total width <= 1000), target_x is locked to 0.0.
-        assert_eq!(engine.viewport.target_x, 0.0);
+        // Because the columns exceed the viewport, target_x is not locked to 0.0.
+        assert_eq!(engine.viewport.target_x, -5.0);
     }
 
     #[test]
@@ -1110,24 +1145,24 @@ mod tests {
         assert!((rect1.2 - 960.0).abs() < 1e-5);
         assert!((rect1.3 - 560.0).abs() < 1e-5);
 
-        // Verify window 2 rect (workspace 1) - should be half size next
+        // Verify window 2 rect (workspace 1) - should be full size next
         let rect2 = engine.get_window_rect(w2).unwrap();
         assert!((rect2.0 - 20.0).abs() < 1e-5);
         assert!((rect2.1 - 708.88889).abs() < 1e-5);
-        assert!((rect2.2 - 475.0).abs() < 1e-5);
+        assert!((rect2.2 - 950.0).abs() < 1e-5);
         assert!((rect2.3 - 560.0).abs() < 1e-5);
 
-        // Verify window 3 rect (workspace 1) - should be half size next
+        // Verify window 3 rect (workspace 1) - should be full size next
         let rect3 = engine.get_window_rect(w3).unwrap();
-        assert!((rect3.0 - 505.0).abs() < 1e-5);
+        assert!((rect3.0 - 980.0).abs() < 1e-5);
         assert!((rect3.1 - 708.88889).abs() < 1e-5);
-        assert!((rect3.2 - 475.0).abs() < 1e-5);
+        assert!((rect3.2 - 950.0).abs() < 1e-5);
         assert!((rect3.3 - 560.0).abs() < 1e-5);
 
         // Verify camera recentering for active workspace 1
         engine.recenter_camera(true);
         assert!((engine.viewport.target_y - 145.0).abs() < 1e-5);
-        assert!((engine.viewport.target_x - (-165.875)).abs() < 1e-5);
+        assert!((engine.viewport.target_x - 154.75).abs() < 1e-5);
 
         // Verify camera recentering for active workspace 0
         engine.active_workspace_idx = 0;

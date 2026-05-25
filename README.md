@@ -88,6 +88,28 @@ Run the unified compiler check, unit tests, visual edge verification, scroll for
 
 ---
 
+## 🛡️ Security Model & Boundary Testing
+
+`hier` is built with a threat-aware architecture focusing on containerized containment and logical control boundary validation. 
+
+### 1. Sandboxed Client Isolation
+* **Bubblewrap Containment:** Run untrusted Wayland clients under `sandbox_run.sh` with strict filesystem namespaces. The home directory is mounted on an in-memory volatile `tmpfs` buffer, and the host control socket is completely unreachable from inside the sandbox.
+
+### 2. Control Socket Permissions
+* **Owner-Only Access:** The Unix sockets (`/tmp/hier-ctrl-*.sock`) restrict file permissions to `0600` (read/write exclusively by the owner process), preventing session hijacking or unauthorized key/mouse injection by other local users.
+
+### 3. Monotonic Clock Guard
+* **Input Injection Time Alignment:** Simulated hardware inputs calculate timestamps from a monotonic logical clock in the compositor's event loop, preventing time-subtraction underflow panics in seat input decoders during rapid automation injection.
+
+### 4. Safety Validation Suite
+Run the security checks and input injection boundary tests:
+* **Permissions Check:** `./safety_tests/test_socket_permissions.py` (checks socket permission mode bits).
+* **Sandbox Verification:** `./safety_tests/test_sandbox_isolation.py` (asserts control sockets are invisible inside bwrap).
+* **RPA CAPTCHA Bypass Demo:** `./safety_tests/test_browser_rpa_defense.py` (simulates focus-targeting, string typing, and captcha challenge solving).
+
+---
+
 ## 📜 License
 
 Distributed under the MIT License. See [LICENSE](LICENSE) for details.
+

@@ -66,7 +66,13 @@ pub struct State {
     pub highlighted_window: Option<(WindowId, [f32; 4])>,
     pub child_display_socket: Option<String>,
     pub workspace_swipe_accumulator: f32,
+    pub start_time: std::time::Instant,
+    pub last_event_time: u32,
+    pub depth_switcher_active: bool,
+    pub depth_switcher_previous_mode: Option<crate::layout::TilingMode>,
 }
+
+
 
 impl State {
     pub fn new(display_handle: DisplayHandle, layout_engine: LayoutEngine, output: Output, socket_name: String) -> Self {
@@ -103,19 +109,148 @@ impl State {
             highlighted_window: None,
             child_display_socket: None,
             workspace_swipe_accumulator: 0.0,
+            start_time: std::time::Instant::now(),
+            last_event_time: 0,
+            depth_switcher_active: false,
+            depth_switcher_previous_mode: None,
         }
+
+
+    }
+
+    pub fn forward_to_child(&self, cmd: &str) -> bool {
+        // 1. Try dynamic auto-registered child display socket
+        if let Some(ref child_display) = self.child_display_socket {
+            let child_socket = format!("/tmp/hier-ctrl-{}.sock", child_display);
+            if std::path::Path::new(&child_socket).exists() {
+                use std::io::Write;
+                if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&child_socket) {
+                    let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(100)));
+                    let _ = stream.set_write_timeout(Some(std::time::Duration::from_millis(100)));
+                    let formatted_cmd = format!("{}\n", cmd);
+                    if stream.write_all(formatted_cmd.as_bytes()).is_ok() {
+                        let _ = stream.flush();
+                        return true;
+                    }
+                }
+            }
+        }
+
+        // 2. Fallback to sequential guess wayland-(num+1)
+        if let Some(num_str) = self.socket_name.strip_prefix("wayland-") {
+            if let Ok(num) = num_str.parse::<u32>() {
+                let child_socket = format!("/tmp/hier-ctrl-wayland-{}.sock", num + 1);
+                if std::path::Path::new(&child_socket).exists() {
+                    use std::io::Write;
+                    if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&child_socket) {
+                        let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(100)));
+                        let _ = stream.set_write_timeout(Some(std::time::Duration::from_millis(100)));
+                        let formatted_cmd = format!("{}\n", cmd);
+                        if stream.write_all(formatted_cmd.as_bytes()).is_ok() {
+                            let _ = stream.flush();
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+
+        false
+    }
+
+    pub fn is_nested_compositor_window(&self, win_id: WindowId) -> bool {
+        if let Some(win) = self.windows.get(&win_id) {
+            let title = win.toplevel().and_then(|t| {
+                smithay::wayland::compositor::with_states(t.wl_surface(), |states| {
+                    states
+                        .data_map
+                        .get::<smithay::wayland::shell::xdg::XdgToplevelSurfaceData>()
+                        .unwrap()
+                        .lock()
+                        .unwrap()
+                        .title
+                        .clone()
+                })
+            });
+            let app_id = win.toplevel().and_then(|t| {
+                smithay::wayland::compositor::with_states(t.wl_surface(), |states| {
+                    states
+                        .data_map
+                        .get::<smithay::wayland::shell::xdg::XdgToplevelSurfaceData>()
+                        .unwrap()
+                        .lock()
+                        .unwrap()
+                        .app_id
+                        .clone()
+                })
+            });
+
+            if let Some(t) = title {
+                let t_lower = t.to_lowercase();
+                if t_lower.contains("smithay") || t_lower.contains("hier") {
+                    return true;
+                }
+            }
+            if let Some(a) = app_id {
+                let a_lower = a.to_lowercase();
+                if a_lower.contains("smithay") || a_lower.contains("hier") {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    pub fn cycle_depth_stack(&mut self, forward: bool) {
+        let len = self.layout_engine.windows.len();
+        if len == 0 {
+            return;
+        }
+        let current_idx = self.layout_engine.depth_scroll_progress.round() as usize;
+        let next_idx = if forward {
+            (current_idx + 1) % len
+        } else {
+            (current_idx + len - 1) % len
+        };
+        self.layout_engine.depth_scroll_progress = next_idx as f32;
+        
+        if let Some(&active_win_id) = self.layout_engine.windows.get(next_idx) {
+            let ws = self.layout_engine.active_workspace_mut();
+            if let Some((col_idx, win_idx)) = ws.find_window(active_win_id) {
+                ws.focused_column_idx = col_idx;
+                ws.columns[col_idx].focused_window_idx = win_idx;
+            }
+            let surface = self.windows.get(&active_win_id)
+                .and_then(|w| w.wl_surface().map(|c| c.into_owned()));
+            if let Some(surface) = surface {
+                self.set_keyboard_focus(Some(surface));
+            }
+            println!("[cycle_depth_stack] Focus updated to window {:?}", active_win_id);
+        }
+        self.reposition_windows();
     }
 
     pub fn window_under_pointer(&self, pointer_pos: Point<f64, smithay::utils::Logical>) -> Option<WindowId> {
-        let is_overview = self.layout_engine.tiling_mode == crate::layout::TilingMode::Overview;
-        if is_overview {
-            let scale = 0.45_f32;
+        let current_scale = self.layout_engine.current_overview_scale;
+        let is_scaled = self.layout_engine.tiling_mode == crate::layout::TilingMode::Overview 
+            || (current_scale - 1.0).abs() > 1e-3;
+        
+        if is_scaled {
+            let t = ((1.0 - current_scale) / 0.55).clamp(0.0, 1.0);
             for (&win_id, _) in &self.windows {
-                if let Some((x, y, w, h)) = self.layout_engine.get_window_rect(win_id) {
-                    let sx = x * scale;
-                    let sy = y * scale;
-                    let sw = w * scale;
-                    let sh = h * scale;
+                let rect_normal = self.layout_engine.get_window_rect_for_mode(win_id, &self.layout_engine.underlying_tiling_mode);
+                let rect_overview = self.layout_engine.get_window_rect_for_mode(win_id, &crate::layout::TilingMode::Overview);
+                
+                if let (Some((nx, ny, nw, nh)), Some((ox, oy, ow, oh))) = (rect_normal, rect_overview) {
+                    let x = nx + (ox - nx) * t;
+                    let y = ny + (oy - ny) * t;
+                    let w = nw + (ow - nw) * t;
+                    let h = nh + (oh - nh) * t;
+                    
+                    let sx = x * current_scale;
+                    let sy = y * current_scale;
+                    let sw = w * current_scale;
+                    let sh = h * current_scale;
                     
                     if pointer_pos.x >= sx as f64 && pointer_pos.x < (sx + sw) as f64
                         && pointer_pos.y >= sy as f64 && pointer_pos.y < (sy + sh) as f64 {
@@ -155,11 +290,13 @@ impl State {
     }
 
     pub fn set_keyboard_focus(&mut self, focus: Option<WlSurface>) {
+        println!("[set_keyboard_focus] Setting keyboard focus to surface: {:?}", focus);
         if let Some(keyboard) = self.seat.get_keyboard() {
             let serial = SERIAL_COUNTER.next_serial();
             keyboard.set_focus(self, focus, serial);
         }
     }
+
 
     /// Positions all mapped windows inside the Smithay `Space` based on our `LayoutEngine`'s coordinates.
     pub fn reposition_windows(&mut self) {
@@ -177,20 +314,32 @@ impl State {
         // Loop through current active workspace's columns and map the focused window of each column
         let active_ws = self.layout_engine.active_workspace();
 
+        // Determine which mode to use for client logical geometry
+        let geom_mode = if self.layout_engine.tiling_mode == crate::layout::TilingMode::Overview {
+            &self.layout_engine.underlying_tiling_mode
+        } else {
+            &self.layout_engine.tiling_mode
+        };
+
         for col in &active_ws.columns {
             if let Some(win) = col.focused_window() {
                 if let Some(smithay_win) = self.windows.get(&win.id) {
-                    if let Some((x, y, w, h)) = self.layout_engine.get_window_rect(win.id) {
+                    if let Some((x, y, w, h)) = self.layout_engine.get_window_rect_for_mode(win.id, geom_mode) {
                         // Tell the client to resize to match our tiling layout column dimensions
                         let toplevel = smithay_win.toplevel().unwrap();
-                        toplevel.with_pending_state(|state| {
-                            state.size = Some((w as i32, h as i32).into());
-                        });
-                        toplevel.send_configure();
+                        let current_size = toplevel.current_state().size;
+                        let target_size = Some((w as i32, h as i32).into());
+                        
+                        if current_size != target_size {
+                            toplevel.with_pending_state(|state| {
+                                state.size = target_size;
+                            });
+                            toplevel.send_configure();
+                        }
 
                         // Map in Smithay's Space Logical Coordinate system
                         self.space.map_element(smithay_win.clone(), (x as i32, y as i32), true);
-                        println!("Reposition window ID={:?} (Title: {:?}): position=({}, {}), size=({}x{})", win.id, win.title, x, y, w, h);
+                        println!("Reposition window ID={:?} (Title: {:?}): position=({}, {}), size=({}x{}) using mode {:?}", win.id, win.title, x, y, w, h, geom_mode);
                     }
                 }
             }
@@ -203,7 +352,9 @@ impl State {
             InputEvent::Keyboard { event } => {
                 let serial = SERIAL_COUNTER.next_serial();
                 let time = event.time_msec();
+                self.last_event_time = self.last_event_time.max(time);
                 let keycode = event.key_code();
+
                 let key_state = event.state();
 
                 let keyboard = self.seat.get_keyboard().unwrap();
@@ -222,17 +373,12 @@ impl State {
             InputEvent::PointerMotionAbsolute { event } => {
                 let serial = SERIAL_COUNTER.next_serial();
                 let time = event.time_msec();
+                self.last_event_time = self.last_event_time.max(time);
                 let raw_pos = event.position();
-                let mut pos = Point::from((raw_pos.x, raw_pos.y));
 
-                if self.output.current_transform() == smithay::utils::Transform::Flipped180 {
-                    if let Some(mode) = self.output.current_mode() {
-                        pos = Point::from((
-                            (mode.size.w - pos.x as i32) as f64,
-                            (mode.size.h - pos.y as i32) as f64,
-                        ));
-                    }
-                }
+                let pos = Point::from((raw_pos.x, raw_pos.y));
+
+
 
                 let pointer = self.seat.get_pointer().unwrap();
 
@@ -277,7 +423,9 @@ impl State {
             InputEvent::PointerButton { event } => {
                 let serial = SERIAL_COUNTER.next_serial();
                 let time = event.time_msec();
+                self.last_event_time = self.last_event_time.max(time);
                 let button = event.button_code();
+
                 let state = event.state();
 
                 let pointer = self.seat.get_pointer().unwrap();
@@ -289,8 +437,8 @@ impl State {
                     if self.layout_engine.tiling_mode == crate::layout::TilingMode::Overview {
                         if let Some(win_id) = self.window_under_pointer(pos) {
                             self.focus_window_by_id(win_id);
-                            self.layout_engine.tiling_mode = crate::layout::TilingMode::Grid;
-                            self.layout_engine.recenter_camera(true);
+                            self.layout_engine.tiling_mode = self.layout_engine.underlying_tiling_mode.clone();
+                            self.layout_engine.recenter_camera(false);
                             self.reposition_windows();
                             return;
                         }
@@ -339,12 +487,20 @@ impl State {
                 let keyboard = self.seat.get_keyboard().unwrap();
                 let modifiers = keyboard.modifier_state();
                 
-                if modifiers.logo {
+                if modifiers.logo || modifiers.alt {
                     let amount = event.amount(Axis::Vertical)
                         .or_else(|| event.amount_v120(Axis::Vertical).map(|v| v / 120.0))
                         .unwrap_or(0.0);
                     
-                    if amount != 0.0 && self.layout_engine.tiling_mode == crate::layout::TilingMode::Depth {
+                    if amount != 0.0 {
+                        if !self.depth_switcher_active {
+                            self.depth_switcher_previous_mode = Some(self.layout_engine.tiling_mode.clone());
+                            self.depth_switcher_active = true;
+                            self.layout_engine.tiling_mode = crate::layout::TilingMode::Depth;
+                            self.layout_engine.depth_scroll_progress = 0.0;
+                            println!("[concept] Depth stacking Alt/Tab switcher activated via scroll. Previous tiling mode: {:?}", self.depth_switcher_previous_mode);
+                        }
+
                         let delta = amount as f32;
                         self.layout_engine.scroll_z(delta);
                         
@@ -367,7 +523,9 @@ impl State {
                 }
                 
                 let time = event.time_msec();
+                self.last_event_time = self.last_event_time.max(time);
                 let mut frame = AxisFrame::new(time);
+
                 if let Some(val) = event.amount(Axis::Horizontal) {
                     frame = frame.value(Axis::Horizontal, val);
                 } else if let Some(val) = event.amount_v120(Axis::Horizontal) {
@@ -605,32 +763,41 @@ fn find_terminal_cmd() -> String {
             }
             "tiling-mode-diagonal" | "tiling_mode_diagonal" => {
                 self.layout_engine.tiling_mode = crate::layout::TilingMode::Diagonal;
+                self.layout_engine.underlying_tiling_mode = crate::layout::TilingMode::Diagonal;
                 self.layout_engine.recenter_camera(true);
                 self.reposition_windows();
                 Ok(())
             }
             "tiling-mode-grid" | "tiling_mode_grid" => {
                 self.layout_engine.tiling_mode = crate::layout::TilingMode::Grid;
+                self.layout_engine.underlying_tiling_mode = crate::layout::TilingMode::Grid;
                 self.layout_engine.recenter_camera(true);
                 self.reposition_windows();
                 Ok(())
             }
             "tiling-mode-float" | "tiling_mode_float" => {
                 self.layout_engine.tiling_mode = crate::layout::TilingMode::Float;
+                self.layout_engine.underlying_tiling_mode = crate::layout::TilingMode::Float;
                 self.layout_engine.recenter_camera(true);
                 self.reposition_windows();
                 Ok(())
             }
             "tiling-mode-depth" | "tiling_mode_depth" => {
                 self.layout_engine.tiling_mode = crate::layout::TilingMode::Depth;
+                self.layout_engine.underlying_tiling_mode = crate::layout::TilingMode::Depth;
                 self.layout_engine.depth_scroll_progress = 0.0;
                 self.layout_engine.recenter_camera(true);
                 self.reposition_windows();
                 Ok(())
             }
             "tiling-mode-overview" | "tiling_mode_overview" => {
-                self.layout_engine.tiling_mode = crate::layout::TilingMode::Overview;
-                self.layout_engine.recenter_camera(true);
+                if self.layout_engine.tiling_mode == crate::layout::TilingMode::Overview {
+                    self.layout_engine.tiling_mode = self.layout_engine.underlying_tiling_mode.clone();
+                } else {
+                    self.layout_engine.underlying_tiling_mode = self.layout_engine.tiling_mode.clone();
+                    self.layout_engine.tiling_mode = crate::layout::TilingMode::Overview;
+                }
+                self.layout_engine.recenter_camera(false);
                 self.reposition_windows();
                 Ok(())
             }
@@ -666,6 +833,18 @@ fn find_terminal_cmd() -> String {
     ) -> FilterResult<()> {
         if key_state == KeyState::Pressed {
             if modifiers.logo || modifiers.alt {
+                if keysym.raw() == keysyms::KEY_z || keysym.raw() == keysyms::KEY_Z {
+                    if !self.depth_switcher_active {
+                        self.depth_switcher_previous_mode = Some(self.layout_engine.tiling_mode.clone());
+                        self.depth_switcher_active = true;
+                        self.layout_engine.tiling_mode = crate::layout::TilingMode::Depth;
+                        self.layout_engine.depth_scroll_progress = 0.0;
+                        println!("[concept] Depth stacking Alt/Tab switcher activated. Previous tiling mode: {:?}", self.depth_switcher_previous_mode);
+                    }
+                    self.cycle_depth_stack(!modifiers.shift);
+                    return smithay::input::keyboard::FilterResult::Intercept(());
+                }
+
                 if modifiers.shift {
                     match keysym.raw() {
                         keysyms::KEY_Left | keysyms::KEY_h => {
@@ -749,6 +928,17 @@ fn find_terminal_cmd() -> String {
                 }
             }
         }
+        if key_state == KeyState::Released {
+            if self.depth_switcher_active && !modifiers.logo && !modifiers.alt {
+                let original_mode = self.depth_switcher_previous_mode.take().unwrap_or(crate::layout::TilingMode::Grid);
+                println!("[concept] Depth stacking Alt/Tab switcher deactivated. Restoring previous tiling mode: {:?}", original_mode);
+                self.depth_switcher_active = false;
+                self.layout_engine.tiling_mode = original_mode;
+                self.layout_engine.recenter_camera(false);
+                self.reposition_windows();
+                return smithay::input::keyboard::FilterResult::Intercept(());
+            }
+        }
         smithay::input::keyboard::FilterResult::Forward
     }
 
@@ -774,16 +964,28 @@ fn find_terminal_cmd() -> String {
                     _ => return "error: key state must be pressed or released\n".to_string(),
                 };
 
+                // Recursive Forwarding to Nest Child
+                let is_nested = self.layout_engine.active_workspace().focused_column()
+                    .and_then(|col| col.focused_window().map(|w| w.id))
+                    .map(|id| self.is_nested_compositor_window(id))
+                    .unwrap_or(false);
+
+                if is_nested {
+                    let cmd = format!("keyboard_key {} {}", keycode, parts[2]);
+                    println!("[keyboard_key] Forwarding simulated key to nested child: {}", cmd);
+                    self.forward_to_child(&cmd);
+                }
+
                 let serial = SERIAL_COUNTER.next_serial();
-                let time = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis() as u32;
+                self.last_event_time += 10;
+                let time = self.last_event_time;
+
 
                 let keyboard = self.seat.get_keyboard().unwrap();
+                // Offset keycode from evdev to XKB format (evdev + 8) to avoid smithay's internal subtraction overflow panic.
                 keyboard.input(
                     self,
-                    keycode.into(),
+                    (keycode + 8).into(),
                     key_state,
                     serial,
                     time,
@@ -807,20 +1009,102 @@ fn find_terminal_cmd() -> String {
                     Err(_) => return "error: invalid y coordinate\n".to_string(),
                 };
 
-                let pos = Point::from((x, y));
+                // Clamp mouse cursor to current camera viewport bounds to prevent it from getting lost
+                let vp = &self.layout_engine.viewport;
+                let min_x = vp.x as f64;
+                let max_x = (vp.x + vp.width) as f64;
+                let min_y = vp.y as f64;
+                let max_y = (vp.y + vp.height) as f64;
+
+                let clamped_x = x.clamp(min_x, max_x);
+                let clamped_y = y.clamp(min_y, max_y);
+
+                let pos = Point::from((clamped_x, clamped_y));
                 let pointer = self.seat.get_pointer().unwrap();
 
                 let under = self.space.element_under(pos);
+
+                // Recursive Forwarding to Nest Child (as pointer_motion_local)
+                if let Some((win, local_pos)) = under.as_ref() {
+                    if let Some(id) = self.windows.iter().find(|(_, w)| **w == **win).map(|(id, _)| *id) {
+                        if self.is_nested_compositor_window(id) {
+                            let local_x = local_pos.x as f64;
+                            let local_y = local_pos.y as f64;
+                            let cmd = format!("pointer_motion_local {} {}", local_x, local_y);
+                            println!("[pointer_motion] Forwarding simulated local motion to nested child: {}", cmd);
+                            self.forward_to_child(&cmd);
+                        }
+                    }
+                }
+
                 let focus = under.and_then(|(win, local_pos)| {
                     win.surface_under(local_pos.to_f64(), WindowSurfaceType::ALL)
                         .map(|(surface, surface_local_pos)| (surface, surface_local_pos.to_f64()))
                 });
 
                 let serial = SERIAL_COUNTER.next_serial();
-                let time = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis() as u32;
+                self.last_event_time += 10;
+                let time = self.last_event_time;
+
+
+                pointer.motion(
+                    self,
+                    focus,
+                    &smithay::input::pointer::MotionEvent {
+                        location: pos,
+                        time,
+                        serial,
+                    },
+                );
+                pointer.frame(self);
+                "ok\n".to_string()
+            }
+            "pointer_motion_local" => {
+                if parts.len() < 3 {
+                    return "error: pointer_motion_local requires x and y\n".to_string();
+                }
+                let x = match parts[1].parse::<f64>() {
+                    Ok(val) => val,
+                    Err(_) => return "error: invalid x coordinate\n".to_string(),
+                };
+                let y = match parts[2].parse::<f64>() {
+                    Ok(val) => val,
+                    Err(_) => return "error: invalid y coordinate\n".to_string(),
+                };
+
+                let vp = &self.layout_engine.viewport;
+                let clamped_x = x.clamp(0.0, vp.width as f64);
+                let clamped_y = y.clamp(0.0, vp.height as f64);
+
+                let global_x = clamped_x + vp.x as f64;
+                let global_y = clamped_y + vp.y as f64;
+
+                let pos = Point::from((global_x, global_y));
+                let pointer = self.seat.get_pointer().unwrap();
+
+                let under = self.space.element_under(pos);
+
+                // Recursive Forwarding to Nest Child
+                if let Some((win, local_pos)) = under.as_ref() {
+                    if let Some(id) = self.windows.iter().find(|(_, w)| **w == **win).map(|(id, _)| *id) {
+                        if self.is_nested_compositor_window(id) {
+                            let local_x = local_pos.x as f64;
+                            let local_y = local_pos.y as f64;
+                            let cmd = format!("pointer_motion_local {} {}", local_x, local_y);
+                            println!("[pointer_motion_local] Forwarding simulated local motion to nested child: {}", cmd);
+                            self.forward_to_child(&cmd);
+                        }
+                    }
+                }
+
+                let focus = under.and_then(|(win, local_pos)| {
+                    win.surface_under(local_pos.to_f64(), WindowSurfaceType::ALL)
+                        .map(|(surface, surface_local_pos)| (surface, surface_local_pos.to_f64()))
+                });
+
+                let serial = SERIAL_COUNTER.next_serial();
+                self.last_event_time += 10;
+                let time = self.last_event_time;
 
                 pointer.motion(
                     self,
@@ -849,16 +1133,15 @@ fn find_terminal_cmd() -> String {
                 };
 
                 let serial = SERIAL_COUNTER.next_serial();
-                let time = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis() as u32;
+                self.last_event_time += 10;
+                let time = self.last_event_time;
+
 
                 let pointer = self.seat.get_pointer().unwrap();
                 let pos = pointer.current_location();
 
                 // Find focus surface under pointer coordinate in a separate block to satisfy borrow checker
-                let (focus, surface) = {
+                let (focus, surface, is_nested) = {
                     let under = self.space.element_under(pos);
                     let focus = under.as_ref().and_then(|(win, local_pos)| {
                         win.surface_under(
@@ -869,9 +1152,19 @@ fn find_terminal_cmd() -> String {
                             (surface.clone(), surface_local_pos.to_f64())
                         })
                     });
-                    let surface = under.and_then(|(win, _)| win.wl_surface().map(|c| c.into_owned()));
-                    (focus, surface)
+                    let surface = under.as_ref().and_then(|(win, _)| win.wl_surface().map(|c| c.into_owned()));
+                    let is_nested = under.as_ref().and_then(|(win, _)| {
+                        self.windows.iter().find(|(_, w)| **w == **win).map(|(id, _)| self.is_nested_compositor_window(*id))
+                    }).unwrap_or(false);
+                    (focus, surface, is_nested)
                 };
+
+                // Recursive Forwarding to Nest Child
+                if is_nested {
+                    let cmd = format!("pointer_button {} {}", button, parts[2]);
+                    println!("[pointer_button] Forwarding simulated button to nested child: {}", cmd);
+                    self.forward_to_child(&cmd);
+                }
 
                 pointer.motion(
                     self,
@@ -898,8 +1191,8 @@ fn find_terminal_cmd() -> String {
                     if self.layout_engine.tiling_mode == crate::layout::TilingMode::Overview {
                         if let Some(win_id) = self.window_under_pointer(pos) {
                             self.focus_window_by_id(win_id);
-                            self.layout_engine.tiling_mode = crate::layout::TilingMode::Grid;
-                            self.layout_engine.recenter_camera(true);
+                            self.layout_engine.tiling_mode = self.layout_engine.underlying_tiling_mode.clone();
+                            self.layout_engine.recenter_camera(false);
                             self.reposition_windows();
                             return "ok\n".to_string();
                         }
@@ -924,12 +1217,26 @@ fn find_terminal_cmd() -> String {
                     Err(_) => return "error: invalid vertical scroll\n".to_string(),
                 };
 
-                let time = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis() as u32;
-
                 let pointer = self.seat.get_pointer().unwrap();
+                let pos = pointer.current_location();
+
+                // Recursive Forwarding to Nest Child
+                let under = self.space.element_under(pos);
+                if let Some((win, _)) = under.as_ref() {
+                    if let Some(id) = self.windows.iter().find(|(_, w)| **w == **win).map(|(id, _)| *id) {
+                        if self.is_nested_compositor_window(id) {
+                            let cmd = format!("pointer_axis {} {}", horizontal, vertical);
+                            println!("[pointer_axis] Forwarding simulated axis to nested child: {}", cmd);
+                            self.forward_to_child(&cmd);
+                        }
+                    }
+                }
+
+                self.last_event_time += 10;
+                let time = self.last_event_time;
+
+
+
                 let mut frame = AxisFrame::new(time);
                 frame = frame.value(Axis::Horizontal, horizontal);
                 frame = frame.value(Axis::Vertical, vertical);
@@ -951,6 +1258,20 @@ fn find_terminal_cmd() -> String {
                     Err(_) => return "error: invalid dy\n".to_string(),
                 };
 
+                let pointer = self.seat.get_pointer().unwrap();
+                let pos = pointer.current_location();
+
+                // Recursive Forwarding to Nest Child
+                let under = self.space.element_under(pos);
+                if let Some((win, _)) = under.as_ref() {
+                    if let Some(id) = self.windows.iter().find(|(_, w)| **w == **win).map(|(id, _)| *id) {
+                        if self.is_nested_compositor_window(id) {
+                            let cmd = format!("pointer_gesture_swipe {} {}", dx, dy);
+                            self.forward_to_child(&cmd);
+                        }
+                    }
+                }
+
                 if dx.abs() > dy.abs() {
                     let speed = 2.0;
                     self.layout_engine.viewport.target_x += dx as f32 * speed;
@@ -969,6 +1290,7 @@ fn find_terminal_cmd() -> String {
                 "ok\n".to_string()
             }
             "pointer_gesture_swipe_end" => {
+                self.forward_to_child("pointer_gesture_swipe_end");
                 self.layout_engine.recenter_camera(false);
                 self.reposition_windows();
                 "ok\n".to_string()
@@ -1001,46 +1323,9 @@ fn find_terminal_cmd() -> String {
                 println!("[pointer_axis_z] z_val: {}", z_val);
 
                 // Recursive Nest Doll Scroll Forwarding
-                let mut forwarded = false;
-                
-                // 1. Try dynamic auto-registered child display socket
-                if let Some(ref child_display) = self.child_display_socket {
-                    let child_socket = format!("/tmp/hier-ctrl-{}.sock", child_display);
-                    if std::path::Path::new(&child_socket).exists() {
-                        println!("[pointer_axis_z] Forwarding Z-scroll to registered child socket: {}", child_socket);
-                        use std::io::Write;
-                        if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&child_socket) {
-                            let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(100)));
-                            let _ = stream.set_write_timeout(Some(std::time::Duration::from_millis(100)));
-                            let cmd = format!("pointer_axis_z {}\n", z_val);
-                            if stream.write_all(cmd.as_bytes()).is_ok() {
-                                forwarded = true;
-                                println!("[pointer_axis_z] Successfully forwarded Z-scroll to registered child.");
-                            }
-                        }
-                    }
-                }
-
-                // 2. Fallback to sequential guess wayland-(num+1)
-                if !forwarded {
-                    if let Some(num_str) = self.socket_name.strip_prefix("wayland-") {
-                        if let Ok(num) = num_str.parse::<u32>() {
-                            let child_socket = format!("/tmp/hier-ctrl-wayland-{}.sock", num + 1);
-                            if std::path::Path::new(&child_socket).exists() {
-                                println!("[pointer_axis_z] Forwarding Z-scroll to guessed child socket: {}", child_socket);
-                                use std::io::Write;
-                                if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&child_socket) {
-                                    let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(100)));
-                                    let _ = stream.set_write_timeout(Some(std::time::Duration::from_millis(100)));
-                                    let cmd = format!("pointer_axis_z {}\n", z_val);
-                                    if stream.write_all(cmd.as_bytes()).is_ok() {
-                                        forwarded = true;
-                                        println!("[pointer_axis_z] Successfully forwarded Z-scroll to guessed child.");
-                                    }
-                                }
-                            }
-                        }
-                    }
+                let forwarded = self.forward_to_child(&format!("pointer_axis_z {}", z_val));
+                if forwarded {
+                    println!("[pointer_axis_z] Successfully forwarded Z-scroll to nested child.");
                 }
 
                 if !forwarded {
@@ -1458,29 +1743,122 @@ fn find_terminal_cmd() -> String {
                         let width = w as usize;
                         let height = h as usize;
                         let mut rgb_data = vec![30u8; width * height * 3];
+                        let mut rgba_data = vec![30u8; width * height * 4];
                         
                         for py in 0..height {
                             for px in 0..width {
-                                let idx = (py * width + px) * 3;
+                                let idx3 = (py * width + px) * 3;
+                                let idx4 = (py * width + px) * 4;
                                 if py < 4 || py >= height - 4 || px < 4 || px >= width - 4 {
-                                    rgb_data[idx] = 30;
-                                    rgb_data[idx + 1] = 144;
-                                    rgb_data[idx + 2] = 255;
+                                    rgb_data[idx3] = 30;
+                                    rgb_data[idx3 + 1] = 144;
+                                    rgb_data[idx3 + 2] = 255;
+                                    
+                                    rgba_data[idx4] = 30;
+                                    rgba_data[idx4 + 1] = 144;
+                                    rgba_data[idx4 + 2] = 255;
+                                } else {
+                                    rgba_data[idx4] = 30;
+                                    rgba_data[idx4 + 1] = 30;
+                                    rgba_data[idx4 + 2] = 30;
                                 }
+                                rgba_data[idx4 + 3] = 255;
                             }
                         }
                         
+                        let mut file_ok = false;
                         use std::io::Write;
                         match std::fs::File::create(path) {
                             Ok(mut file) => {
                                 let header = format!("P6\n{} {}\n255\n", width, height);
                                 if file.write_all(header.as_bytes()).is_ok() && file.write_all(&rgb_data).is_ok() {
-                                    format!("ok: exported {} window (size {}x{}) to {}\n", title, width, height, path)
-                                } else {
-                                    "error: failed to write PPM bytes\n".to_string()
+                                    file_ok = true;
                                 }
                             }
-                            Err(e) => format!("error: failed to create file: {}\n", e),
+                            Err(_) => {}
+                        }
+                        
+                        let mut clip_ok = false;
+                        if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                            let img_data = arboard::ImageData {
+                                width,
+                                height,
+                                bytes: std::borrow::Cow::from(&rgba_data),
+                            };
+                            if clipboard.set_image(img_data).is_ok() {
+                                clip_ok = true;
+                            }
+                        }
+                        
+                        match (file_ok, clip_ok) {
+                            (true, true) => format!("ok: exported {} window (size {}x{}) to {} and copied to clipboard\n", title, width, height, path),
+                            (true, false) => format!("ok: exported {} window (size {}x{}) to {}, but failed to copy to clipboard\n", title, width, height, path),
+                            (false, true) => format!("ok: copied {} window (size {}x{}) to clipboard, but failed to write to {}\n", title, width, height, path),
+                            (false, false) => "error: failed to write file and failed to copy to clipboard\n".to_string(),
+                        }
+                    } else {
+                        "error: window geometry not found\n".to_string()
+                    }
+                } else {
+                    "error: window not found\n".to_string()
+                }
+            }
+            "copy_window_to_clipboard" | "copy-window-to-clipboard" => {
+                if parts.len() < 2 {
+                    return "error: copy_window_to_clipboard requires window_id\n".to_string();
+                }
+                let id = match parts[1].parse::<u32>() {
+                    Ok(val) => val,
+                    Err(_) => return "error: invalid window_id\n".to_string(),
+                };
+                if let Some(win) = self.windows.get(&WindowId(id)) {
+                    let title = win.toplevel().map(|t| {
+                        smithay::wayland::compositor::with_states(t.wl_surface(), |states| {
+                            states
+                                .data_map
+                                .get::<smithay::wayland::shell::xdg::XdgToplevelSurfaceData>()
+                                .unwrap()
+                                .lock()
+                                .unwrap()
+                                .title
+                                .clone()
+                        }).unwrap_or_else(|| "Wayland Window".to_string())
+                    }).unwrap_or_else(|| "Unknown".to_string());
+                    
+                    if let Some((_x, _y, w, h)) = self.layout_engine.get_window_rect(WindowId(id)) {
+                        let width = w as usize;
+                        let height = h as usize;
+                        let mut rgba_data = vec![30u8; width * height * 4];
+                        
+                        for py in 0..height {
+                            for px in 0..width {
+                                let idx = (py * width + px) * 4;
+                                if py < 4 || py >= height - 4 || px < 4 || px >= width - 4 {
+                                    rgba_data[idx] = 30;
+                                    rgba_data[idx + 1] = 144;
+                                    rgba_data[idx + 2] = 255;
+                                } else {
+                                    rgba_data[idx] = 30;
+                                    rgba_data[idx + 1] = 30;
+                                    rgba_data[idx + 2] = 30;
+                                }
+                                rgba_data[idx + 3] = 255;
+                            }
+                        }
+                        
+                        match arboard::Clipboard::new() {
+                            Ok(mut clipboard) => {
+                                let img_data = arboard::ImageData {
+                                    width,
+                                    height,
+                                    bytes: std::borrow::Cow::from(&rgba_data),
+                                };
+                                match clipboard.set_image(img_data) {
+                                    Ok(_) => format!("ok: copied {} window (size {}x{}) to clipboard\n", title, width, height),
+                                    Err(e) => format!("error: failed to set clipboard image: {}\n", e),
+                                }
+                            }
+                            Err(e) => format!("error: failed to initialize clipboard: {}\n", e),
                         }
                     } else {
                         "error: window geometry not found\n".to_string()
@@ -1524,6 +1902,7 @@ fn find_terminal_cmd() -> String {
 
                 let layout_json = serde_json::json!({
                     "active_workspace_idx": self.layout_engine.active_workspace_idx,
+                    "tiling_mode": format!("{:?}", self.layout_engine.tiling_mode),
                     "viewport": {
                         "x": self.layout_engine.viewport.x,
                         "y": self.layout_engine.viewport.y,
@@ -1588,6 +1967,43 @@ fn find_terminal_cmd() -> String {
                     Err(e) => format!("error: failed to serialize windows: {}\n", e),
                 }
             }
+            "get_camera" | "get-camera" => {
+                format!(
+                    "{},{},{},{},{},{},{:?}\n",
+                    self.layout_engine.viewport.x,
+                    self.layout_engine.viewport.y,
+                    self.layout_engine.viewport.target_x,
+                    self.layout_engine.viewport.target_y,
+                    self.layout_engine.viewport.width,
+                    self.layout_engine.viewport.height,
+                    self.layout_engine.tiling_mode
+                )
+            }
+            "set_camera" | "set-camera" => {
+                if parts.len() < 3 {
+                    return "error: set_camera requires x and y\n".to_string();
+                }
+                let x = match parts[1].parse::<f32>() {
+                    Ok(val) => val,
+                    Err(_) => return "error: invalid x\n".to_string(),
+                };
+                let y = match parts[2].parse::<f32>() {
+                    Ok(val) => val,
+                    Err(_) => return "error: invalid y\n".to_string(),
+                };
+                let immediate = parts.get(3).map(|&s| s == "true" || s == "immediate").unwrap_or(false);
+                
+                self.layout_engine.viewport.target_x = x;
+                self.layout_engine.viewport.target_y = y;
+                if immediate {
+                    self.layout_engine.viewport.x = x;
+                    self.layout_engine.viewport.y = y;
+                    self.layout_engine.viewport.velocity_x = 0.0;
+                    self.layout_engine.viewport.velocity_y = 0.0;
+                }
+                self.reposition_windows();
+                "ok\n".to_string()
+            }
             other => format!("error: unknown command '{}'\n", other),
         }
     }
@@ -1608,6 +2024,12 @@ impl CompositorHandler for State {
     fn commit(&mut self, surface: &WlSurface) {
         // Run standard buffer commit handler to handle client texture updates
         smithay::backend::renderer::utils::on_commit_buffer_handler::<Self>(surface);
+
+        if let Some(window) = self.windows.values().find(|w| {
+            w.wl_surface().map(|s| s.as_ref() == surface).unwrap_or(false)
+        }) {
+            window.on_commit();
+        }
     }
 }
 
@@ -1661,16 +2083,15 @@ impl XdgShellHandler for State {
         });
         surface.send_configure();
 
-        // Title retrieval
+        // Title and app_id retrieval, falling back to app_id if title is None (e.g. for fuzzel)
         let title = smithay::wayland::compositor::with_states(surface.wl_surface(), |states| {
-            states
+            let data = states
                 .data_map
                 .get::<smithay::wayland::shell::xdg::XdgToplevelSurfaceData>()
                 .unwrap()
                 .lock()
-                .unwrap()
-                .title
-                .clone()
+                .unwrap();
+            data.title.clone().or_else(|| data.app_id.clone())
         }).unwrap_or_else(|| "Wayland Window".to_string());
 
         println!("Window mapped: ID={:?}, Title={:?}", window_id, title);
@@ -1680,6 +2101,10 @@ impl XdgShellHandler for State {
 
         // Store mapping and reposition windows
         self.windows.insert(window_id, window);
+
+        // Automatically assign keyboard focus to newly mapped window
+        self.set_keyboard_focus(Some(surface.wl_surface().clone()));
+
         self.reposition_windows();
     }
 

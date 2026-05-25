@@ -74,8 +74,7 @@ def main():
     
     # Resolve paths
     base_dir = os.path.dirname(os.path.realpath(__file__))
-    artifacts_dir = "/home/super/.gemini/antigravity/brain/f93f86a1-b0d6-49ce-b82f-d76376c60ee0"
-    scratch_z_scroll_test = os.path.join(artifacts_dir, "scratch/test_scroll_rpa_z.py")
+    scratch_z_scroll_test = os.path.join(base_dir, "scratch/test_scroll_rpa_z.py")
 
     # Stage 1: Cargo Compilation
     ok, out = run_stage("Cargo Build", ["cargo", "build"], cwd=base_dir)
@@ -133,10 +132,16 @@ def main():
             time.sleep(2.0)
             
             # Spawn a client window in the compositor
+            import shutil
+            term = "foot"
+            if not shutil.which(term):
+                term = "alacritty"
+                if not shutil.which(term):
+                    term = "xterm"
             client_env = os.environ.copy()
             client_env["WAYLAND_DISPLAY"] = display_name
             client_env["LIBGL_ALWAYS_SOFTWARE"] = "1"
-            client_proc = subprocess.Popen(["alacritty"], env=client_env)
+            client_proc = subprocess.Popen([term], env=client_env)
             time.sleep(2.5) # allow client map
             
             # Run vision_agent.py targeted at this compositor
@@ -232,6 +237,15 @@ def main():
     except Exception as e:
         print(f"❌ Error in Telemetry Diagnostics Stage: {e}")
         results["6. Telemetry Diagnostics"] = (False, str(e))
+
+    # Stage 7: Antigravity Visual Integration
+    visual_test_script = os.path.join(base_dir, "scratch/test_visual_antigravity.py")
+    if os.path.exists(visual_test_script):
+        ok, out = run_stage("Antigravity Visual Integration", ["python3", visual_test_script], cwd=base_dir, timeout=120.0)
+        results["7. Antigravity Visual Integration"] = (ok, out)
+    else:
+        print(f"[!] Warning: Visual test script not found at {visual_test_script}. Skipping Stage 7.")
+        results["7. Antigravity Visual Integration"] = (False, "Visual test script missing")
 
     # Print Final Summary Matrix
     print_banner("TEST RUN REPORT SUMMARY MATRIX")

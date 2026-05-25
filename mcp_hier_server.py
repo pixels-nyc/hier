@@ -281,6 +281,42 @@ def handle_tools_list():
                     "display": {"type": "string", "description": "Optional Wayland display name."}
                 }
             }
+        },
+        {
+            "name": "get_camera",
+            "description": "Get current camera/viewport offsets, dimensions, and tiling mode.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "display": {"type": "string", "description": "Optional Wayland display name."}
+                }
+            }
+        },
+        {
+            "name": "set_camera",
+            "description": "Move the camera/viewport to specified coordinates.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "x": {"type": "number", "description": "The target x coordinate."},
+                    "y": {"type": "number", "description": "The target y coordinate."},
+                    "immediate": {"type": "boolean", "description": "Whether to snap immediately (true) or smooth scroll (false)."},
+                    "display": {"type": "string", "description": "Optional Wayland display name."}
+                },
+                "required": ["x", "y"]
+            }
+        },
+        {
+            "name": "inject_viewport_input",
+            "description": "Inject an input command with viewport-relative mouse coordinates automatically translated to global compositor space.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "The input command (e.g. 'pointer_motion 100 200')."},
+                    "display": {"type": "string", "description": "Optional Wayland display name."}
+                },
+                "required": ["command"]
+            }
         }
     ]
     return {"tools": tools}
@@ -344,6 +380,45 @@ def handle_tools_call(name, args):
         
     elif name == "restore_session":
         res = send_command(display, "restore_session")
+        return {
+            "content": [{"type": "text", "text": res}]
+        }
+        
+    elif name == "get_camera":
+        res = send_command(display, "get_camera")
+        return {
+            "content": [{"type": "text", "text": res}]
+        }
+        
+    elif name == "set_camera":
+        x = args["x"]
+        y = args["y"]
+        imm_val = "true" if args.get("immediate") else "false"
+        res = send_command(display, f"set_camera {x} {y} {imm_val}")
+        return {
+            "content": [{"type": "text", "text": res}]
+        }
+        
+    elif name == "inject_viewport_input":
+        cmd = args["command"]
+        # Check if this is a pointer_motion command with coordinates
+        match = re.match(r"^\s*pointer_motion\s+([-\d.]+)\s+([-\d.]+)\s*$", cmd)
+        if match:
+            # We need to offset the local mouse coordinates using current camera viewport position
+            cam_res = send_command(display, "get_camera")
+            cam_parts = cam_res.strip().split(",")
+            if len(cam_parts) >= 2:
+                try:
+                    cam_x = float(cam_parts[0])
+                    cam_y = float(cam_parts[1])
+                    local_x = float(match.group(1))
+                    local_y = float(match.group(2))
+                    global_x = local_x + cam_x
+                    global_y = local_y + cam_y
+                    cmd = f"pointer_motion {global_x} {global_y}"
+                except ValueError:
+                    pass
+        res = send_command(display, cmd)
         return {
             "content": [{"type": "text", "text": res}]
         }

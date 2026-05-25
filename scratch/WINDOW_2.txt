@@ -1,0 +1,12 @@
+================================================================================
+                          POSITION: WINDOW 2 (CENTER)
+================================================================================
+
+This client window represents WINDOW 2 in the multi-column tiling layout.
+
+Role & Position:
+- In Grid / Diagonal tiling modes: Renders as the CENTER column.
+- In Depth stacking mode: Acts as the active/focused tab/card.
+- Serves as the primary viewport target for camera centering snaps.
+
+================================================================================

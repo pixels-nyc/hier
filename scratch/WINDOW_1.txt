@@ -1,0 +1,12 @@
+================================================================================
+                           POSITION: WINDOW 1 (LEFT)
+================================================================================
+
+This client window represents WINDOW 1 in the multi-column tiling layout.
+
+Role & Position:
+- In Grid / Diagonal tiling modes: Renders as the LEFT column.
+- In Depth stacking mode: Acts as the bottom tab/card in the Z-axis stack.
+- Serves as the initial target for workspace shifting and focus swaps.
+
+================================================================================
