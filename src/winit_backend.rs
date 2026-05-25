@@ -19,6 +19,7 @@ smithay::backend::renderer::element::render_elements! {
     pub MyRenderElement<=smithay::backend::renderer::gles::GlesRenderer>;
     Space = smithay::desktop::space::SpaceRenderElements<smithay::backend::renderer::gles::GlesRenderer, smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement<smithay::backend::renderer::gles::GlesRenderer>>,
     Solid = smithay::backend::renderer::element::solid::SolidColorRenderElement,
+    Surface = smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement<smithay::backend::renderer::gles::GlesRenderer>,
 }
 
 pub fn detect_host_transform() -> Transform {
@@ -118,10 +119,12 @@ pub fn run_winit_compositor() -> Result<(), Box<dyn std::error::Error>> {
     let (backend, winit_event_loop) = winit::init::<smithay::backend::renderer::gles::GlesRenderer>()?;
     let backend = Rc::new(RefCell::new(backend));
 
-    let size = backend.borrow().window().inner_size();
+    // Determine initial window size, applying fullscreen if requested
     if std::env::var("HIER_FULLSCREEN").is_ok() {
         backend.borrow().window().set_fullscreen(Some(::winit::window::Fullscreen::Borderless(None)));
     }
+    // After any fullscreen change, fetch the (potentially updated) inner size
+    let size = backend.borrow().window().inner_size();
     let layout_engine = crate::layout::LayoutEngine::new(
         size.width as f32,
         size.height as f32,
@@ -275,6 +278,7 @@ pub fn run_winit_compositor() -> Result<(), Box<dyn std::error::Error>> {
 
     // Register Winit Event Loop
     let backend_clone = backend.clone();
+    let mut fullscreen_attempts = 0;
     loop_handle.insert_source(winit_event_loop, move |event, _, state| {
         match event {
             WinitEvent::Resized { size, .. } => {
@@ -295,6 +299,10 @@ pub fn run_winit_compositor() -> Result<(), Box<dyn std::error::Error>> {
                 state.process_input(event);
             }
             WinitEvent::Redraw => {
+                if std::env::var("HIER_FULLSCREEN").is_ok() && fullscreen_attempts < 5 {
+                    backend_clone.borrow().window().set_fullscreen(Some(::winit::window::Fullscreen::Borderless(None)));
+                    fullscreen_attempts += 1;
+                }
                 let mut backend = backend_clone.borrow_mut();
                 let age = backend.buffer_age().unwrap_or(0);
                 
@@ -322,8 +330,8 @@ pub fn run_winit_compositor() -> Result<(), Box<dyn std::error::Error>> {
                             let border_thickness = 4;
                             let scale_factor = state.output.current_scale().fractional_scale();
                             
-                            let px = (x as f64 * scale_factor) as i32;
-                            let py = (y as f64 * scale_factor) as i32;
+                            let px = ((x - state.layout_engine.viewport.x) as f64 * scale_factor) as i32;
+                            let py = ((y - state.layout_engine.viewport.y) as f64 * scale_factor) as i32;
                             let pw = (w as f64 * scale_factor) as i32;
                             let ph = (h as f64 * scale_factor) as i32;
                             let pb = (border_thickness as f64 * scale_factor) as i32;
@@ -376,9 +384,94 @@ pub fn run_winit_compositor() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
 
-                    // 2. Add space elements (windows)
-                    for elem in space_elements {
-                        render_elements.push(MyRenderElement::Space(elem));
+                    if state.layout_engine.tiling_mode == crate::layout::TilingMode::Depth {
+                        let transforms = state.layout_engine.depth_transforms();
+                        let scale_factor = state.output.current_scale().fractional_scale();
+
+                        for (win_id, transform) in transforms {
+                            if let Some(smithay_win) = state.windows.get(&win_id) {
+                                if let Some((x, y, w, h)) = state.layout_engine.get_window_rect(win_id) {
+                                    let scaled_w = w * transform.scale;
+                                    let scaled_h = h * transform.scale;
+                                    let x_offset = (w - scaled_w) / 2.0;
+                                    let y_offset = (h - scaled_h) / 2.0 + (transform.y_offset as f32);
+
+                                    let px = (((x + x_offset) - state.layout_engine.viewport.x) as f64 * scale_factor) as i32;
+                                    let py = (((y + y_offset) - state.layout_engine.viewport.y) as f64 * scale_factor) as i32;
+
+                                    let location = smithay::utils::Point::from((px, py));
+                                    let scale = smithay::utils::Scale::from(scale_factor * transform.scale as f64);
+
+                                    use smithay::backend::renderer::element::AsRenderElements;
+                                    let elems: Vec<MyRenderElement> = AsRenderElements::render_elements(
+                                        smithay_win,
+                                        renderer,
+                                        location,
+                                        scale,
+                                        transform.opacity,
+                                    );
+                                    render_elements.extend(elems);
+                                }
+                            }
+                        }
+                    } else if state.layout_engine.tiling_mode == crate::layout::TilingMode::Overview {
+                        let scale = 0.45_f32;
+                        let spacing = 40.0_f32;
+                        let scale_factor = state.output.current_scale().fractional_scale();
+                        let line_color = smithay::backend::renderer::Color32F::from([0.3f32, 0.3f32, 0.3f32, 1.0f32]);
+
+                        use smithay::backend::renderer::element::solid::SolidColorRenderElement;
+                        use smithay::utils::{Rectangle, Point, Size};
+                        use smithay::backend::renderer::element::Kind;
+                        use smithay::backend::renderer::utils::CommitCounter;
+
+                        // 1. Draw workspace separator lines
+                        for ws_idx in 0..state.layout_engine.workspaces.len().saturating_sub(1) {
+                            let y_start = ws_idx as f32 * (state.layout_engine.viewport.height * scale + spacing);
+                            let y_line = y_start + state.layout_engine.viewport.height * scale + (spacing / 2.0);
+
+                            let px = 0;
+                            let py = ((y_line - state.layout_engine.viewport.y) as f64 * scale_factor) as i32;
+                            let pw = (state.layout_engine.viewport.width as f64 * scale_factor) as i32;
+                            let ph = (2.0f64 * scale_factor) as i32;
+
+                            let id_line = smithay::backend::renderer::element::Id::new();
+                            render_elements.push(MyRenderElement::Solid(SolidColorRenderElement::new(
+                                id_line,
+                                Rectangle::new(Point::from((px, py)), Size::from((pw, ph))),
+                                CommitCounter::default(),
+                                line_color,
+                                Kind::Unspecified,
+                            )));
+                        }
+
+                        // 2. Draw scaled windows
+                        for (&win_id, smithay_win) in &state.windows {
+                            if let Some((x, y, _w, _h)) = state.layout_engine.get_window_rect(win_id) {
+                                let sx = x * scale;
+                                let sy = y * scale;
+                                let px = ((sx - state.layout_engine.viewport.x) as f64 * scale_factor) as i32;
+                                let py = ((sy - state.layout_engine.viewport.y) as f64 * scale_factor) as i32;
+
+                                let location = smithay::utils::Point::from((px, py));
+                                let scale_val = smithay::utils::Scale::from(scale_factor * scale as f64);
+
+                                use smithay::backend::renderer::element::AsRenderElements;
+                                let elems: Vec<MyRenderElement> = AsRenderElements::render_elements(
+                                    smithay_win,
+                                    renderer,
+                                    location,
+                                    scale_val,
+                                    1.0,
+                                );
+                                render_elements.extend(elems);
+                            }
+                        }
+                    } else {
+                        // 2. Add space elements (windows)
+                        for elem in space_elements {
+                            render_elements.push(MyRenderElement::Space(elem));
+                        }
                     }
 
                     damage_tracker.render_output(

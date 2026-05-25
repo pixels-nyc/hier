@@ -148,6 +148,60 @@ def render_display_tree(display_name: str, workspaces: dict):
                 print(f"{col_child_prefix}{win_prefix}{focus_marker} Window ID {win['id']}: \"{win['title']}\" [{win['rect']}]")
     print()
 
+def print_nest(display_name: str, workspaces: dict, child_map: dict, indent: str = "", is_last: bool = True):
+    nest_prefix = "└── " if is_last else "├── "
+    next_indent = indent + ("    " if is_last else "│   ")
+
+    active_marker = " (Active Focus)" if os.environ.get("WAYLAND_DISPLAY") == display_name else ""
+    print(f"{indent}{nest_prefix}Nest [{display_name}]{active_marker}")
+
+    has_child = display_name in child_map
+
+    if not workspaces:
+        ws_prefix = "├── " if has_child else "└── "
+        print(f"{next_indent}{ws_prefix}(No active workspaces or mapped windows)")
+    else:
+        sorted_workspaces = sorted(workspaces.keys())
+        for i, ws_idx in enumerate(sorted_workspaces):
+            cols = workspaces[ws_idx]
+            is_last_ws = (i == len(sorted_workspaces) - 1) and not has_child
+            ws_prefix = "└── " if is_last_ws else "├── "
+            ws_child_prefix = next_indent + ("    " if is_last_ws else "│   ")
+
+            print(f"{next_indent}{ws_prefix}Workspace {ws_idx + 1}")
+
+            if not cols:
+                print(f"{ws_child_prefix}└── (Empty)")
+                continue
+
+            sorted_cols = sorted(cols.keys())
+            for j, col_idx in enumerate(sorted_cols):
+                wins = cols[col_idx]
+                is_last_col = (j == len(sorted_cols) - 1)
+                col_prefix = "└── " if is_last_col else "├── "
+                col_child_prefix = ws_child_prefix + ("    " if is_last_col else "│   ")
+
+                is_stacked = len(wins) > 1
+                col_info = " (Tab Stack)" if is_stacked else ""
+                print(f"{ws_child_prefix}{col_prefix}Column {col_idx}{col_info}")
+
+                for idx, win in enumerate(wins):
+                    is_last_win = (idx == len(wins) - 1)
+                    win_prefix = "└── " if is_last_win else "├── "
+                    focus_marker = "[★]" if win["focused"] else "[ ]"
+                    print(f"{col_child_prefix}{win_prefix}{focus_marker} Window ID {win['id']}: \"{win['title']}\" [{win['rect']}]")
+
+    if has_child:
+        child_disp = child_map[display_name]
+        child_socket_path = f"/tmp/hier-ctrl-{child_disp}.sock"
+        child_workspaces = {}
+        if os.path.exists(child_socket_path):
+            child_layout_str = send_cmd(child_socket_path, "get_layout_compact")
+            if not child_layout_str.startswith("error:"):
+                child_workspaces = parse_layout(child_layout_str)
+
+        print_nest(child_disp, child_workspaces, child_map, next_indent, is_last=True)
+
 def main():
     parser = argparse.ArgumentParser(
         description="Inspect and visualize active workspaces and windows in hier nested displays."
@@ -162,6 +216,11 @@ def main():
         help="Scan and visualize all active nested displays."
     )
     parser.add_argument(
+        "--nest-mode", "-n",
+        action="store_true",
+        help="Display nested compositor tree structure."
+    )
+    parser.add_argument(
         "--screenshot-dir", "-s",
         help="Directory to save window screenshots to."
     )
@@ -169,7 +228,7 @@ def main():
     args = parser.parse_args()
     
     targets = []
-    if args.all:
+    if args.all or args.nest_mode:
         # Scan /tmp/hier-ctrl-*.sock
         pattern = "/tmp/hier-ctrl-wayland-*.sock"
         for path in glob.glob(pattern):
@@ -183,43 +242,74 @@ def main():
     else:
         disp = args.display or os.environ.get("WAYLAND_DISPLAY")
         if not disp:
-            print("❌ Error: No Wayland display specified. Run inside Nest(N) or specify --display / --all.")
+            print("❌ Error: No Wayland display specified. Run inside Nest(N) or specify --display / --all / --nest-mode.")
             sys.exit(1)
         targets.append(disp)
         
-    for disp in targets:
-        socket_path = f"/tmp/hier-ctrl-{disp}.sock"
-        if not os.path.exists(socket_path):
-            print(f"⚠️ Warning: Control socket for display '{disp}' not found at: {socket_path}")
-            continue
-            
-        layout_str = send_cmd(socket_path, "get_layout_compact")
-        if layout_str.startswith("error:"):
-            print(f"❌ Failed to query layout for display '{disp}': {layout_str.strip()}")
-            continue
-            
-        workspaces = parse_layout(layout_str)
-        render_display_tree(disp, workspaces)
+    if args.nest_mode:
+        # Build child relationships
+        child_map = {}
+        has_parent = set()
+        for disp in targets:
+            socket_path = f"/tmp/hier-ctrl-{disp}.sock"
+            if os.path.exists(socket_path):
+                child_res = send_cmd(socket_path, "get_child_display").strip()
+                if child_res and not child_res.startswith("error:") and child_res != "none":
+                    child_map[disp] = child_res
+                    has_parent.add(child_res)
 
-        if args.screenshot_dir:
-            os.makedirs(args.screenshot_dir, exist_ok=True)
-            for ws_idx, cols in workspaces.items():
-                for col_idx, wins in cols.items():
-                    for win in wins:
-                        win_id = win["id"]
-                        temp_ppm_path = os.path.join(args.screenshot_dir, f"capture_{disp}_win_{win_id}.ppm")
-                        png_path = os.path.join(args.screenshot_dir, f"capture_{disp}_win_{win_id}.png")
-                        print(f"[*] Capturing screenshot of Window {win_id} on display {disp}...")
-                        res = send_cmd(socket_path, f"capture_window {win_id} {temp_ppm_path}")
-                        if "error" in res.lower() or not os.path.exists(temp_ppm_path):
-                            print(f"  ❌ Failed to capture window {win_id}: {res.strip()}")
-                        else:
-                            try:
-                                ppm_to_png(temp_ppm_path, png_path)
-                                os.remove(temp_ppm_path)
-                                print(f"  ✅ Saved screenshot to: {png_path}")
-                            except Exception as e:
-                                print(f"  ❌ Failed to convert PPM to PNG for window {win_id}: {e}")
+        roots = [t for t in targets if t not in has_parent]
+        if not roots:
+            roots = targets
+            
+        print("==================================================")
+        print("      NESTED COMPOSITOR MULTI-VIEW STATUS")
+        print("==================================================")
+        for idx, root in enumerate(roots):
+            socket_path = f"/tmp/hier-ctrl-{root}.sock"
+            workspaces = {}
+            if os.path.exists(socket_path):
+                layout_str = send_cmd(socket_path, "get_layout_compact")
+                if not layout_str.startswith("error:"):
+                    workspaces = parse_layout(layout_str)
+            
+            is_last = (idx == len(roots) - 1)
+            print_nest(root, workspaces, child_map, indent="", is_last=is_last)
+
+    else:
+        for disp in targets:
+            socket_path = f"/tmp/hier-ctrl-{disp}.sock"
+            if not os.path.exists(socket_path):
+                print(f"⚠️ Warning: Control socket for display '{disp}' not found at: {socket_path}")
+                continue
+
+            layout_str = send_cmd(socket_path, "get_layout_compact")
+            if layout_str.startswith("error:"):
+                print(f"❌ Failed to query layout for display '{disp}': {layout_str.strip()}")
+                continue
+
+            workspaces = parse_layout(layout_str)
+            render_display_tree(disp, workspaces)
+
+            if args.screenshot_dir:
+                os.makedirs(args.screenshot_dir, exist_ok=True)
+                for ws_idx, cols in workspaces.items():
+                    for col_idx, wins in cols.items():
+                        for win in wins:
+                            win_id = win["id"]
+                            temp_ppm_path = os.path.join(args.screenshot_dir, f"capture_{disp}_win_{win_id}.ppm")
+                            png_path = os.path.join(args.screenshot_dir, f"capture_{disp}_win_{win_id}.png")
+                            print(f"[*] Capturing screenshot of Window {win_id} on display {disp}...")
+                            res = send_cmd(socket_path, f"capture_window {win_id} {temp_ppm_path}")
+                            if "error" in res.lower() or not os.path.exists(temp_ppm_path):
+                                print(f"  ❌ Failed to capture window {win_id}: {res.strip()}")
+                            else:
+                                try:
+                                    ppm_to_png(temp_ppm_path, png_path)
+                                    os.remove(temp_ppm_path)
+                                    print(f"  ✅ Saved screenshot to: {png_path}")
+                                except Exception as e:
+                                    print(f"  ❌ Failed to convert PPM to PNG for window {win_id}: {e}")
 
 if __name__ == "__main__":
     main()

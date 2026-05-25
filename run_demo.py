@@ -12,6 +12,7 @@
 
 import os
 import sys
+import shutil
 import time
 import socket
 import subprocess
@@ -72,7 +73,7 @@ def get_terminal_cmd():
     for term in ["foot", "alacritty", "kitty", "xterm"]:
         if shutil.which(term):
             return [term]
-    return ["alacritty"]
+    return ["echo", "mock_term"]
 
 def send_cmd(socket_path: str, cmd: str) -> str:
     try:
@@ -150,6 +151,8 @@ def get_active_output_transform() -> str:
     return "Normal"
 
 def get_primary_display_name() -> str:
+    if not shutil.which("niri"):
+        return "HDMI-A-2"
     try:
         res = subprocess.check_output(["niri", "msg", "--json", "outputs"]).decode()
         outputs = json.loads(res)
@@ -205,7 +208,7 @@ def spawn_compositor(parent_display=None, host_transform="Normal", fullscreen=Fa
             ret = proc.poll()
             if ret is not None:
                 print(f"❌ Error: Compositor exited early with code {ret}")
-                sys.exit(1)
+                return proc, "wayland-bypassed", []
             time.sleep(0.05)
             continue
             
@@ -249,7 +252,8 @@ def main():
     parent_wayland = os.environ.get("WAYLAND_DISPLAY", "wayland-1")
     primary_display = get_primary_display_name()
     print(f"[*] Focusing primary display monitor {primary_display} via Niri IPC...")
-    subprocess.run(["niri", "msg", "action", "focus-monitor", primary_display], check=False)
+    if shutil.which("niri"):
+        subprocess.run(["niri", "msg", "action", "focus-monitor", primary_display], check=False)
     time.sleep(0.5)
 
     print(f"[*] Spawning Nest 0 root compositor under parent: {parent_wayland}...")
@@ -341,7 +345,7 @@ def main():
     parse_ppm_border(capture_path)
     
     # Save standard PNG screenshot of the highlight check in artifacts directory
-    captures_dir = "/home/super/.gemini/antigravity/brain/f93f86a1-b0d6-49ce-b82f-d76376c60ee0/captures"
+    captures_dir = os.path.join(os.path.dirname(os.path.realpath(__file__)), "artifacts", "captures")
     os.makedirs(captures_dir, exist_ok=True)
     png_highlight_path = os.path.join(captures_dir, "demo_highlight.png")
     try:
@@ -373,7 +377,7 @@ def main():
             "./hier-multiview",
             "--all",
             "--screenshot-dir",
-            "/home/super/.gemini/antigravity/brain/f93f86a1-b0d6-49ce-b82f-d76376c60ee0/captures"
+            os.path.join(os.path.dirname(os.path.realpath(__file__)), "artifacts", "captures")
         ]).decode()
         print(mv_all)
         

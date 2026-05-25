@@ -34,6 +34,8 @@ def get_active_output_transform() -> str:
     return "Normal"
 
 def get_primary_display_name() -> str:
+    if not shutil.which("niri"):
+        return "HDMI-A-2"
     try:
         res = subprocess.check_output(["niri", "msg", "--json", "outputs"]).decode()
         outputs = json.loads(res)
@@ -336,7 +338,7 @@ def focus_window_by_id(socket_path, target_win_id):
     return False
 
 def main():
-    captures_dir = "/home/super/.gemini/antigravity/brain/f93f86a1-b0d6-49ce-b82f-d76376c60ee0/captures"
+    captures_dir = os.path.join(os.path.dirname(os.path.realpath(__file__)), "artifacts", "captures")
     os.makedirs(captures_dir, exist_ok=True)
     
     print("[*] Rebuilding compositor...")
@@ -348,7 +350,8 @@ def main():
 
     primary_display = get_primary_display_name()
     print(f"[*] Focusing primary display monitor {primary_display} via Niri IPC...")
-    subprocess.run(["niri", "msg", "action", "focus-monitor", primary_display], check=False)
+    if shutil.which("niri"):
+        subprocess.run(["niri", "msg", "action", "focus-monitor", primary_display], check=False)
     time.sleep(0.5)
 
     print("[*] Spawning Nest 0 (Root nested compositor) in fullscreen...")

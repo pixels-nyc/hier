@@ -25,7 +25,11 @@ use smithay::{
 };
 use smithay::reexports::wayland_server::protocol::wl_seat::WlSeat;
 use smithay::backend::winit::WinitInput;
-use smithay::backend::input::{InputEvent, KeyboardKeyEvent, PointerButtonEvent, ButtonState, Event, AbsolutePositionEvent, KeyState, Axis};
+use smithay::backend::input::{
+    InputEvent, KeyboardKeyEvent, PointerButtonEvent, ButtonState, Event,
+    AbsolutePositionEvent, KeyState, Axis, PointerAxisEvent,
+    GestureBeginEvent, GestureSwipeUpdateEvent
+};
 use smithay::wayland::seat::WaylandFocus;
 use smithay::input::keyboard::keysyms;
 
@@ -61,6 +65,7 @@ pub struct State {
     pub socket_name: String,
     pub highlighted_window: Option<(WindowId, [f32; 4])>,
     pub child_display_socket: Option<String>,
+    pub workspace_swipe_accumulator: f32,
 }
 
 impl State {
@@ -97,6 +102,55 @@ impl State {
             socket_name,
             highlighted_window: None,
             child_display_socket: None,
+            workspace_swipe_accumulator: 0.0,
+        }
+    }
+
+    pub fn window_under_pointer(&self, pointer_pos: Point<f64, smithay::utils::Logical>) -> Option<WindowId> {
+        let is_overview = self.layout_engine.tiling_mode == crate::layout::TilingMode::Overview;
+        if is_overview {
+            let scale = 0.45_f32;
+            for (&win_id, _) in &self.windows {
+                if let Some((x, y, w, h)) = self.layout_engine.get_window_rect(win_id) {
+                    let sx = x * scale;
+                    let sy = y * scale;
+                    let sw = w * scale;
+                    let sh = h * scale;
+
+                    if pointer_pos.x >= sx as f64 && pointer_pos.x < (sx + sw) as f64
+                        && pointer_pos.y >= sy as f64 && pointer_pos.y < (sy + sh) as f64 {
+                        return Some(win_id);
+                    }
+                }
+            }
+            None
+        } else {
+            self.space.element_under(pointer_pos).and_then(|(win, _)| {
+                self.windows.iter().find(|(_, w)| **w == *win).map(|(id, _)| *id)
+            })
+        }
+    }
+
+    pub fn focus_window_by_id(&mut self, win_id: WindowId) {
+        let mut found = None;
+        for (ws_idx, ws) in self.layout_engine.workspaces.iter().enumerate() {
+            if let Some((col_idx, win_idx)) = ws.find_window(win_id) {
+                found = Some((ws_idx, col_idx, win_idx));
+                break;
+            }
+        }
+
+        if let Some((ws_idx, col_idx, win_idx)) = found {
+            self.layout_engine.active_workspace_idx = ws_idx;
+            let ws = &mut self.layout_engine.workspaces[ws_idx];
+            ws.focused_column_idx = col_idx;
+            ws.columns[col_idx].focused_window_idx = win_idx;
+
+            let surface = self.windows.get(&win_id)
+                .and_then(|w| w.wl_surface().map(|c| c.into_owned()));
+            if let Some(surface) = surface {
+                self.set_keyboard_focus(Some(surface));
+            }
         }
     }
 
@@ -188,17 +242,26 @@ impl State {
                     self.layout_engine.viewport.y as f64,
                 ));
 
-                // Hit-test: query what window is under the pointer in space coordinates
-                let under = self.space.element_under(space_pos);
-                let focus = under.and_then(|(win, local_pos)| {
-                    win.surface_under(
-                        local_pos.to_f64(),
-                        WindowSurfaceType::ALL,
-                    )
-                    .map(|(surface, surface_local_pos)| {
-                        (surface, surface_local_pos.to_f64())
+                let is_overview = self.layout_engine.tiling_mode == crate::layout::TilingMode::Overview;
+                let focus = if is_overview {
+                    if let Some(win_id) = self.window_under_pointer(space_pos) {
+                        self.highlighted_window = Some((win_id, [0.117, 0.565, 1.0, 1.0])); // Dodger Blue
+                    } else {
+                        self.highlighted_window = None;
+                    }
+                    None
+                } else {
+                    let under = self.space.element_under(space_pos);
+                    under.and_then(|(win, local_pos)| {
+                        win.surface_under(
+                            local_pos.to_f64(),
+                            WindowSurfaceType::ALL,
+                        )
+                        .map(|(surface, surface_local_pos)| {
+                            (surface, surface_local_pos.to_f64())
+                        })
                     })
-                });
+                };
 
                 pointer.motion(
                     self,
@@ -222,6 +285,17 @@ impl State {
                 // Focus window and update pointer focus under cursor on click
                 if state == ButtonState::Pressed {
                     let pos = pointer.current_location();
+
+                    if self.layout_engine.tiling_mode == crate::layout::TilingMode::Overview {
+                        if let Some(win_id) = self.window_under_pointer(pos) {
+                            self.focus_window_by_id(win_id);
+                            self.layout_engine.tiling_mode = crate::layout::TilingMode::Grid;
+                            self.layout_engine.recenter_camera(true);
+                            self.reposition_windows();
+                            return;
+                        }
+                    }
+
                     let under = self.space.element_under(pos);
                     let focus = under.as_ref().and_then(|(win, local_pos)| {
                         win.surface_under(
@@ -260,9 +334,101 @@ impl State {
                 );
                 pointer.frame(self);
             }
+            InputEvent::PointerAxis { event } => {
+                let pointer = self.seat.get_pointer().unwrap();
+                let keyboard = self.seat.get_keyboard().unwrap();
+                let modifiers = keyboard.modifier_state();
+
+                if modifiers.logo {
+                    let amount = event.amount(Axis::Vertical)
+                        .or_else(|| event.amount_v120(Axis::Vertical).map(|v| v / 120.0))
+                        .unwrap_or(0.0);
+
+                    if amount != 0.0 && self.layout_engine.tiling_mode == crate::layout::TilingMode::Depth {
+                        let delta = amount as f32;
+                        self.layout_engine.scroll_z(delta);
+
+                        let active_idx = self.layout_engine.depth_scroll_progress.round() as usize;
+                        if let Some(&active_win_id) = self.layout_engine.windows.get(active_idx) {
+                            let ws = self.layout_engine.active_workspace_mut();
+                            if let Some((col_idx, win_idx)) = ws.find_window(active_win_id) {
+                                ws.focused_column_idx = col_idx;
+                                ws.columns[col_idx].focused_window_idx = win_idx;
+                            }
+                            let surface = self.windows.get(&active_win_id)
+                                .and_then(|w| w.wl_surface().map(|c| c.into_owned()));
+                            if let Some(surface) = surface {
+                                self.set_keyboard_focus(Some(surface));
+                            }
+                        }
+                        self.reposition_windows();
+                        return;
+                    }
+                }
+
+                let time = event.time_msec();
+                let mut frame = AxisFrame::new(time);
+                if let Some(val) = event.amount(Axis::Horizontal) {
+                    frame = frame.value(Axis::Horizontal, val);
+                } else if let Some(val) = event.amount_v120(Axis::Horizontal) {
+                    frame = frame.v120(Axis::Horizontal, val as i32);
+                }
+                if let Some(val) = event.amount(Axis::Vertical) {
+                    frame = frame.value(Axis::Vertical, val);
+                } else if let Some(val) = event.amount_v120(Axis::Vertical) {
+                    frame = frame.v120(Axis::Vertical, val as i32);
+                }
+                pointer.axis(self, frame);
+                pointer.frame(self);
+            }
+            InputEvent::GestureSwipeBegin { event } => {
+                println!("[Gesture] Swipe begin: fingers={}", GestureBeginEvent::<WinitInput>::fingers(&event));
+            }
+            InputEvent::GestureSwipeUpdate { event } => {
+                let dx = GestureSwipeUpdateEvent::<WinitInput>::delta_x(&event);
+                let dy = GestureSwipeUpdateEvent::<WinitInput>::delta_y(&event);
+                println!("[Gesture] Swipe update: dx={}, dy={}", dx, dy);
+                if dx.abs() > dy.abs() {
+                    // Horizontal scroll on columns ribbon
+                    let speed = 2.0;
+                    self.layout_engine.viewport.target_x += dx as f32 * speed;
+                } else {
+                    // Vertical scroll to switch workspaces
+                    self.workspace_swipe_accumulator += dy as f32;
+                    if self.workspace_swipe_accumulator.abs() > 150.0 {
+                        if self.workspace_swipe_accumulator > 0.0 {
+                            self.layout_engine.focus_workspace_down();
+                        } else {
+                            self.layout_engine.focus_workspace_up();
+                        }
+                        self.workspace_swipe_accumulator = 0.0;
+                    }
+                }
+                self.reposition_windows();
+            }
+            InputEvent::GestureSwipeEnd { event: _ } => {
+                println!("[Gesture] Swipe end");
+                self.layout_engine.recenter_camera(false);
+                self.reposition_windows();
+            }
             _ => {}
         }
     }
+
+fn find_terminal_cmd() -> String {
+    let preferred = ["foot", "alacritty", "kitty", "xterm"];
+    if let Ok(path_var) = std::env::var("PATH") {
+        for term in preferred.iter() {
+            for path_dir in std::env::split_paths(&path_var) {
+                let bin_path = path_dir.join(term);
+                if bin_path.is_file() {
+                    return term.to_string();
+                }
+            }
+        }
+    }
+    "alacritty".to_string() // Fallback
+}
 
     pub fn perform_layout_action(&mut self, action: &str) -> Result<(), String> {
         match action {
@@ -293,29 +459,65 @@ impl State {
                 Ok(())
             }
             "focus-up" | "focus_up" => {
-                self.layout_engine.focus_tab_up();
-                let win_id = self.layout_engine.active_workspace().focused_column()
-                    .and_then(|col| col.focused_window().map(|w| w.id));
-                let surface = win_id
-                    .and_then(|id| self.windows.get(&id))
-                    .and_then(|w| w.wl_surface().map(|c| c.into_owned()));
-                if let Some(surface) = surface {
-                    self.set_keyboard_focus(Some(surface));
+                if self.layout_engine.tiling_mode == crate::layout::TilingMode::Depth {
+                    self.layout_engine.scroll_z(-1.0);
+                    let active_idx = self.layout_engine.depth_scroll_progress.round() as usize;
+                    if let Some(&active_win_id) = self.layout_engine.windows.get(active_idx) {
+                        let ws = self.layout_engine.active_workspace_mut();
+                        if let Some((col_idx, win_idx)) = ws.find_window(active_win_id) {
+                            ws.focused_column_idx = col_idx;
+                            ws.columns[col_idx].focused_window_idx = win_idx;
+                        }
+                        let surface = self.windows.get(&active_win_id)
+                            .and_then(|w| w.wl_surface().map(|c| c.into_owned()));
+                        if let Some(surface) = surface {
+                            self.set_keyboard_focus(Some(surface));
+                        }
+                    }
+                    self.reposition_windows();
+                } else {
+                    self.layout_engine.focus_tab_up();
+                    let win_id = self.layout_engine.active_workspace().focused_column()
+                        .and_then(|col| col.focused_window().map(|w| w.id));
+                    let surface = win_id
+                        .and_then(|id| self.windows.get(&id))
+                        .and_then(|w| w.wl_surface().map(|c| c.into_owned()));
+                    if let Some(surface) = surface {
+                        self.set_keyboard_focus(Some(surface));
+                    }
+                    self.reposition_windows();
                 }
-                self.reposition_windows();
                 Ok(())
             }
             "focus-down" | "focus_down" => {
-                self.layout_engine.focus_tab_down();
-                let win_id = self.layout_engine.active_workspace().focused_column()
-                    .and_then(|col| col.focused_window().map(|w| w.id));
-                let surface = win_id
-                    .and_then(|id| self.windows.get(&id))
-                    .and_then(|w| w.wl_surface().map(|c| c.into_owned()));
-                if let Some(surface) = surface {
-                    self.set_keyboard_focus(Some(surface));
+                if self.layout_engine.tiling_mode == crate::layout::TilingMode::Depth {
+                    self.layout_engine.scroll_z(1.0);
+                    let active_idx = self.layout_engine.depth_scroll_progress.round() as usize;
+                    if let Some(&active_win_id) = self.layout_engine.windows.get(active_idx) {
+                        let ws = self.layout_engine.active_workspace_mut();
+                        if let Some((col_idx, win_idx)) = ws.find_window(active_win_id) {
+                            ws.focused_column_idx = col_idx;
+                            ws.columns[col_idx].focused_window_idx = win_idx;
+                        }
+                        let surface = self.windows.get(&active_win_id)
+                            .and_then(|w| w.wl_surface().map(|c| c.into_owned()));
+                        if let Some(surface) = surface {
+                            self.set_keyboard_focus(Some(surface));
+                        }
+                    }
+                    self.reposition_windows();
+                } else {
+                    self.layout_engine.focus_tab_down();
+                    let win_id = self.layout_engine.active_workspace().focused_column()
+                        .and_then(|col| col.focused_window().map(|w| w.id));
+                    let surface = win_id
+                        .and_then(|id| self.windows.get(&id))
+                        .and_then(|w| w.wl_surface().map(|c| c.into_owned()));
+                    if let Some(surface) = surface {
+                        self.set_keyboard_focus(Some(surface));
+                    }
+                    self.reposition_windows();
                 }
-                self.reposition_windows();
                 Ok(())
             }
             "move-left" | "move_left" => {
@@ -345,8 +547,9 @@ impl State {
             }
             "spawn-terminal" | "spawn_terminal" => {
                 let socket = self.socket_name.clone();
-                println!("Spawning terminal on WAYLAND_DISPLAY={}", socket);
-                let _ = std::process::Command::new("alacritty")
+                let term = Self::find_terminal_cmd();
+                println!("Spawning terminal ({}) on WAYLAND_DISPLAY={}", term, socket);
+                let _ = std::process::Command::new(term)
                     .env("WAYLAND_DISPLAY", socket)
                     .spawn();
                 Ok(())
@@ -371,6 +574,37 @@ impl State {
                     col.focused_window_idx = 0;
                 }
                 self.layout_engine.recenter_camera(false);
+                self.reposition_windows();
+                Ok(())
+            }
+            "tiling-mode-diagonal" | "tiling_mode_diagonal" => {
+                self.layout_engine.tiling_mode = crate::layout::TilingMode::Diagonal;
+                self.layout_engine.recenter_camera(true);
+                self.reposition_windows();
+                Ok(())
+            }
+            "tiling-mode-grid" | "tiling_mode_grid" => {
+                self.layout_engine.tiling_mode = crate::layout::TilingMode::Grid;
+                self.layout_engine.recenter_camera(true);
+                self.reposition_windows();
+                Ok(())
+            }
+            "tiling-mode-float" | "tiling_mode_float" => {
+                self.layout_engine.tiling_mode = crate::layout::TilingMode::Float;
+                self.layout_engine.recenter_camera(true);
+                self.reposition_windows();
+                Ok(())
+            }
+            "tiling-mode-depth" | "tiling_mode_depth" => {
+                self.layout_engine.tiling_mode = crate::layout::TilingMode::Depth;
+                self.layout_engine.depth_scroll_progress = 0.0;
+                self.layout_engine.recenter_camera(true);
+                self.reposition_windows();
+                Ok(())
+            }
+            "tiling-mode-overview" | "tiling_mode_overview" => {
+                self.layout_engine.tiling_mode = crate::layout::TilingMode::Overview;
+                self.layout_engine.recenter_camera(true);
                 self.reposition_windows();
                 Ok(())
             }
@@ -450,6 +684,14 @@ impl State {
                         }
                         keysyms::KEY_c => {
                             let _ = self.perform_layout_action("toggle-tab");
+                            return smithay::input::keyboard::FilterResult::Intercept(());
+                        }
+                        keysyms::KEY_o => {
+                            if self.layout_engine.tiling_mode == crate::layout::TilingMode::Overview {
+                                let _ = self.perform_layout_action("tiling-mode-grid");
+                            } else {
+                                let _ = self.perform_layout_action("tiling-mode-overview");
+                            }
                             return smithay::input::keyboard::FilterResult::Intercept(());
                         }
                         keysyms::KEY_Return => {
@@ -600,6 +842,17 @@ impl State {
 
                 if state == ButtonState::Pressed {
                     let pos = pointer.current_location();
+
+                    if self.layout_engine.tiling_mode == crate::layout::TilingMode::Overview {
+                        if let Some(win_id) = self.window_under_pointer(pos) {
+                            self.focus_window_by_id(win_id);
+                            self.layout_engine.tiling_mode = crate::layout::TilingMode::Grid;
+                            self.layout_engine.recenter_camera(true);
+                            self.reposition_windows();
+                            return "ok\n".to_string();
+                        }
+                    }
+
                     let surface = self.space.element_under(pos)
                         .and_then(|(win, _)| win.wl_surface().map(|c| c.into_owned()));
                     if let Some(surface) = surface {
@@ -635,6 +888,41 @@ impl State {
                 pointer.frame(self);
                 "ok\n".to_string()
             }
+            "pointer_gesture_swipe" => {
+                if parts.len() < 3 {
+                    return "error: pointer_gesture_swipe requires dx and dy\n".to_string();
+                }
+                let dx = match parts[1].parse::<f64>() {
+                    Ok(val) => val,
+                    Err(_) => return "error: invalid dx\n".to_string(),
+                };
+                let dy = match parts[2].parse::<f64>() {
+                    Ok(val) => val,
+                    Err(_) => return "error: invalid dy\n".to_string(),
+                };
+
+                if dx.abs() > dy.abs() {
+                    let speed = 2.0;
+                    self.layout_engine.viewport.target_x += dx as f32 * speed;
+                } else {
+                    self.workspace_swipe_accumulator += dy as f32;
+                    if self.workspace_swipe_accumulator.abs() > 150.0 {
+                        if self.workspace_swipe_accumulator > 0.0 {
+                            self.layout_engine.focus_workspace_down();
+                        } else {
+                            self.layout_engine.focus_workspace_up();
+                        }
+                        self.workspace_swipe_accumulator = 0.0;
+                    }
+                }
+                self.reposition_windows();
+                "ok\n".to_string()
+            }
+            "pointer_gesture_swipe_end" => {
+                self.layout_engine.recenter_camera(false);
+                self.reposition_windows();
+                "ok\n".to_string()
+            }
             "register_child_display" => {
                 if parts.len() < 2 {
                     return "error: register_child_display requires display_name\n".to_string();
@@ -643,6 +931,13 @@ impl State {
                 println!("[register_child_display] Registering child display socket name: {}", child_display);
                 self.child_display_socket = Some(child_display);
                 "ok\n".to_string()
+            }
+            "get_child_display" => {
+                if let Some(ref child) = self.child_display_socket {
+                    format!("{}\n", child)
+                } else {
+                    "none\n".to_string()
+                }
             }
             "pointer_axis_z" => {
                 println!("[pointer_axis_z] Entered");
@@ -699,30 +994,51 @@ impl State {
                 }
 
                 if !forwarded {
-                    println!("[pointer_axis_z] Performing local focus tab switch");
-                    let old_win_id = self.layout_engine.active_workspace().focused_column()
-                        .and_then(|col| col.focused_window().map(|w| w.id));
+                    if self.layout_engine.tiling_mode == crate::layout::TilingMode::Depth {
+                        println!("[pointer_axis_z] Performing depth scroll_z");
+                        self.layout_engine.scroll_z(z_val as f32);
 
-                    if z_val > 0.0 {
-                        self.layout_engine.focus_tab_down();
-                    } else if z_val < 0.0 {
-                        self.layout_engine.focus_tab_up();
-                    }
-
-                    let new_win_id = self.layout_engine.active_workspace().focused_column()
-                        .and_then(|col| col.focused_window().map(|w| w.id));
-
-                    if old_win_id != new_win_id {
-                        println!("[pointer_axis_z] Focus changed from {:?} to {:?}", old_win_id, new_win_id);
-                        let surface = new_win_id
-                            .and_then(|id| self.windows.get(&id))
-                            .and_then(|w| w.wl_surface().map(|c| c.into_owned()));
-                        if let Some(surface) = surface {
-                            self.set_keyboard_focus(Some(surface));
+                        let active_idx = self.layout_engine.depth_scroll_progress.round() as usize;
+                        if let Some(&active_win_id) = self.layout_engine.windows.get(active_idx) {
+                            let ws = self.layout_engine.active_workspace_mut();
+                            if let Some((col_idx, win_idx)) = ws.find_window(active_win_id) {
+                                ws.focused_column_idx = col_idx;
+                                ws.columns[col_idx].focused_window_idx = win_idx;
+                            }
+                            let surface = self.windows.get(&active_win_id)
+                                .and_then(|w| w.wl_surface().map(|c| c.into_owned()));
+                            if let Some(surface) = surface {
+                                self.set_keyboard_focus(Some(surface));
+                            }
+                            println!("[pointer_axis_z] Focus updated to window {:?}", active_win_id);
                         }
                         self.reposition_windows();
                     } else {
-                        println!("[pointer_axis_z] Focus did not change locally.");
+                        println!("[pointer_axis_z] Performing local focus tab switch");
+                        let old_win_id = self.layout_engine.active_workspace().focused_column()
+                            .and_then(|col| col.focused_window().map(|w| w.id));
+
+                        if z_val > 0.0 {
+                            self.layout_engine.focus_tab_down();
+                        } else if z_val < 0.0 {
+                            self.layout_engine.focus_tab_up();
+                        }
+
+                        let new_win_id = self.layout_engine.active_workspace().focused_column()
+                            .and_then(|col| col.focused_window().map(|w| w.id));
+
+                        if old_win_id != new_win_id {
+                            println!("[pointer_axis_z] Focus changed from {:?} to {:?}", old_win_id, new_win_id);
+                            let surface = new_win_id
+                                .and_then(|id| self.windows.get(&id))
+                                .and_then(|w| w.wl_surface().map(|c| c.into_owned()));
+                            if let Some(surface) = surface {
+                                self.set_keyboard_focus(Some(surface));
+                            }
+                            self.reposition_windows();
+                        } else {
+                            println!("[pointer_axis_z] Focus did not change locally.");
+                        }
                     }
                 }
 
@@ -1283,7 +1599,12 @@ impl XdgShellHandler for State {
         self.next_window_id += 1;
 
         // Configure initial size based on layout engine viewport and columns
-        let win_width = self.layout_engine.viewport.width * self.layout_engine.default_width_fraction;
+        let is_occupied = !self.layout_engine.active_workspace().columns.is_empty();
+        let win_width = if is_occupied {
+            self.layout_engine.default_width_fraction * (self.layout_engine.viewport.width - 2.0 * self.layout_engine.outer_margin - self.layout_engine.gap)
+        } else {
+            self.layout_engine.viewport.width - 2.0 * self.layout_engine.outer_margin
+        };
         let win_height = self.layout_engine.viewport.height - 2.0 * self.layout_engine.outer_margin;
         surface.with_pending_state(|state| {
             state.size = Some((win_width as i32, win_height as i32).into());
