@@ -116,7 +116,24 @@ impl Viewport {
 }
 
 /// The core layout engine state.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TilingMode {
+    Diagonal,
+    Grid,
+    Float,
+    Depth,
+    Overview,
+}
+
+// Transform data for Depth mode card stack
+#[derive(Default, Debug, Clone, Copy)]
+pub struct DepthTransform {
+    pub scale: f32,
+    pub opacity: f32,
+    pub y_offset: i32,
+    pub is_active: bool,
+}
+
 pub struct LayoutEngine {
     pub workspaces: Vec<Workspace>,
     pub active_workspace_idx: usize,
@@ -128,6 +145,14 @@ pub struct LayoutEngine {
     pub outer_margin: f32,
     /// Default width fraction of the viewport for new windows (e.g. 0.5 for 50%).
     pub default_width_fraction: f32,
+    /// Tiling mode (Diagonal, Grid, Float, Depth).
+    pub tiling_mode: TilingMode,
+    /// List of window identifiers for Depth mode ordering.
+    pub windows: Vec<WindowId>,
+    /// Continuous scroll progress for Depth mode (0.0 = first window centered).
+    pub depth_scroll_progress: f32,
+    /// Z-scroll sensitivity (determines how fast scroll_z progresses)
+    pub scroll_sensitivity: f32,
 }
 
 impl LayoutEngine {
@@ -143,6 +168,11 @@ impl LayoutEngine {
             workspaces.push(Workspace::new());
         }
 
+        let scroll_sensitivity = std::env::var("HIER_Z_SENSITIVITY")
+            .ok()
+            .and_then(|val| val.parse::<f32>().ok())
+            .unwrap_or(0.1_f32);
+
         Self {
             workspaces,
             active_workspace_idx: 0,
@@ -151,6 +181,10 @@ impl LayoutEngine {
             gap,
             outer_margin,
             default_width_fraction: 0.5,
+            tiling_mode: TilingMode::Grid,
+            windows: Vec::new(),
+            depth_scroll_progress: 0.0,
+            scroll_sensitivity,
         }
     }
 
@@ -177,8 +211,19 @@ impl LayoutEngine {
 
     /// Resize the physical output dimensions.
     pub fn resize_viewport(&mut self, width: f32, height: f32) {
+        let old_width = self.viewport.width;
         self.viewport.width = width;
         self.viewport.height = height;
+
+        if old_width > 0.0 && (width - old_width).abs() > 1e-3 {
+            let scale_factor = width / old_width;
+            for ws in &mut self.workspaces {
+                for col in &mut ws.columns {
+                    col.width *= scale_factor;
+                }
+            }
+        }
+
         self.recenter_camera(false);
     }
 
@@ -188,26 +233,155 @@ impl LayoutEngine {
     pub fn column_positions(&self, workspace_idx: usize) -> Vec<f32> {
         let mut positions = Vec::new();
         if let Some(workspace) = self.workspaces.get(workspace_idx) {
-            let mut current_x = self.outer_margin;
-            for col in &workspace.columns {
-                positions.push(current_x);
-                current_x += col.width + self.gap;
+            match self.tiling_mode {
+                TilingMode::Diagonal => {
+                    let mut current_x = self.outer_margin;
+                    for (i, col) in workspace.columns.iter().enumerate() {
+                        // Diagonal offset based on column index
+                        let diag_offset = i as f32 * self.gap;
+                        positions.push(current_x + diag_offset);
+                        current_x += col.width + self.gap;
+                    }
+                }
+                TilingMode::Grid | TilingMode::Overview => {
+                    // Simple left‑to‑right layout (current behavior)
+                    let mut current_x = self.outer_margin;
+                    for col in &workspace.columns {
+                        positions.push(current_x);
+                        current_x += col.width + self.gap;
+                    }
+                }
+                TilingMode::Float => {
+                    // Floating mode: each column retains its own absolute X (no auto‑arrange)
+                    for col in &workspace.columns {
+                        // Assume the column already stores its absolute X in width field for simplicity
+                        positions.push(col.width);
+                    }
+                }
+                TilingMode::Depth => {
+                    // All columns stacked at the same X position (card carousel)
+                    for _ in &workspace.columns {
+                        positions.push(self.outer_margin);
+                    }
+                }
             }
         }
         positions
     }
 
     /// Updates the camera's target positions to center on the focused column
+    
+    /// Scrolls the depth carousel forward or backward.
+    /// Positive `delta` moves the front column to the back (next item),
+    /// negative `delta` moves the back column to the front (previous item).
+    pub fn scroll_z(&mut self, delta: f32) {
+        // Only applicable in Depth mode
+        if self.tiling_mode != TilingMode::Depth {
+            return;
+        }
+        self.depth_scroll_progress += delta * self.scroll_sensitivity;
+        let max_progress = (self.windows.len().saturating_sub(1)) as f32;
+        self.depth_scroll_progress = self.depth_scroll_progress.clamp(0.0, max_progress);
+    }
+
+    /// Computes spatial transforms for windows in Depth mode, sorted back-to-front
+    pub fn depth_transforms(&self) -> Vec<(WindowId, DepthTransform)> {
+        let mut transforms = Vec::new();
+        for (i, &w_id) in self.windows.iter().enumerate() {
+            let dist = (i as f32) - self.depth_scroll_progress;
+            
+            let (scale, opacity, y_offset) = if dist >= 0.0 {
+                let scale = 1.0 / (1.0 + 0.25 * dist);
+                let opacity = (1.0 - 0.4 * dist).max(0.0);
+                let y_offset = (30.0 * dist) as i32;
+                (scale, opacity, y_offset)
+            } else {
+                let scale = 1.0 - 0.5 * dist;
+                let opacity = (1.0 + dist).max(0.0);
+                let y_offset = (30.0 * dist) as i32;
+                (scale, opacity, y_offset)
+            };
+            
+            let is_active = dist.abs() < 0.5;
+            
+            transforms.push((
+                w_id,
+                DepthTransform {
+                    scale,
+                    opacity,
+                    y_offset,
+                    is_active,
+                },
+            ));
+        }
+
+        // Sort back-to-front (furthest first, i.e. larger dist first)
+        transforms.sort_by(|a, b| {
+            let idx_a = self.windows.iter().position(|&x| x == a.0).unwrap_or(0);
+            let idx_b = self.windows.iter().position(|&x| x == b.0).unwrap_or(0);
+            let dist_a = (idx_a as f32) - self.depth_scroll_progress;
+            let dist_b = (idx_b as f32) - self.depth_scroll_progress;
+            dist_b.partial_cmp(&dist_a).unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        transforms
+    }
+
     /// of the active workspace and the active workspace's vertical offset.
     pub fn recenter_camera(&mut self, immediate: bool) {
         let active_idx = self.active_workspace_idx;
         
+        if self.tiling_mode == TilingMode::Overview {
+            let scale = 0.45_f32;
+            let spacing = 40.0_f32;
+            
+            // Vertical target centered on active workspace stack
+            let target_y = (active_idx as f32 * (self.viewport.height * scale + spacing))
+                + (self.viewport.height * scale / 2.0) - (self.viewport.height / 2.0);
+            self.viewport.target_y = target_y;
+            if immediate {
+                self.viewport.y = target_y;
+                self.viewport.velocity_y = 0.0;
+            }
+
+            // Horizontal target centered on active workspace's focused column
+            let positions = self.column_positions(active_idx);
+            let workspace = &self.workspaces[active_idx];
+            
+            let target_x = if workspace.columns.is_empty() {
+                - (self.viewport.width / 2.0)
+            } else if workspace.columns.len() == 1 {
+                (self.viewport.width / 2.0) * scale - (self.viewport.width / 2.0)
+            } else {
+                let col_idx = workspace.focused_column_idx;
+                let col_x = positions[col_idx];
+                let col_w = workspace.columns[col_idx].width;
+                (col_x + col_w / 2.0) * scale - (self.viewport.width / 2.0)
+            };
+            
+            self.viewport.target_x = target_x;
+            if immediate {
+                self.viewport.x = target_x;
+                self.viewport.velocity_x = 0.0;
+            }
+            return;
+        }
+
         // Vertical workspace target offset
         let target_y = active_idx as f32 * self.viewport.height;
         self.viewport.target_y = target_y;
         if immediate {
             self.viewport.y = target_y;
             self.viewport.velocity_y = 0.0;
+        }
+
+        if self.tiling_mode == TilingMode::Depth {
+            self.viewport.target_x = 0.0;
+            if immediate {
+                self.viewport.x = 0.0;
+                self.viewport.velocity_x = 0.0;
+            }
+            return;
         }
 
         // Horizontal camera target offset (centered on the active column)
@@ -223,17 +397,38 @@ impl LayoutEngine {
             return;
         }
 
-        let col_idx = workspace.focused_column_idx;
-        let col_x = positions[col_idx];
-        let col_w = workspace.columns[col_idx].width;
+        if workspace.columns.len() == 1 {
+            self.viewport.target_x = 0.0;
+            if immediate {
+                self.viewport.x = 0.0;
+                self.viewport.velocity_x = 0.0;
+            }
+        } else {
+            let last_idx = workspace.columns.len() - 1;
+            let last_col_x = positions[last_idx];
+            let last_col_w = workspace.columns[last_idx].width;
+            let total_width = last_col_x + last_col_w + self.outer_margin;
 
-        // Center the active column in the viewport
-        let target_x = col_x + (col_w / 2.0) - (self.viewport.width / 2.0);
-        self.viewport.target_x = target_x;
+            if total_width <= self.viewport.width {
+                self.viewport.target_x = 0.0;
+                if immediate {
+                    self.viewport.x = 0.0;
+                    self.viewport.velocity_x = 0.0;
+                }
+            } else {
+                let col_idx = workspace.focused_column_idx;
+                let col_x = positions[col_idx];
+                let col_w = workspace.columns[col_idx].width;
 
-        if immediate {
-            self.viewport.x = target_x;
-            self.viewport.velocity_x = 0.0;
+                // Center the active column in the viewport
+                let target_x = col_x + (col_w / 2.0) - (self.viewport.width / 2.0);
+                self.viewport.target_x = target_x;
+
+                if immediate {
+                    self.viewport.x = target_x;
+                    self.viewport.velocity_x = 0.0;
+                }
+            }
         }
     }
 
@@ -250,9 +445,12 @@ impl LayoutEngine {
     /// Spawns a new window. It will be added to the right of the currently
     /// focused column. If no columns exist, it initializes the first column.
     pub fn spawn_window(&mut self, window_id: WindowId, title: String) {
-        let win_width = self.viewport.width * self.default_width_fraction;
+        let win_width = self.default_width_fraction * (self.viewport.width - 2.0 * self.outer_margin - self.gap);
         let window = Window { id: window_id, title };
         let column = Column::new(window, win_width);
+        
+        // Track window ordering for Depth mode
+        self.windows.push(window_id);
         
         let workspace = self.active_workspace_mut();
         if workspace.columns.is_empty() {
@@ -263,7 +461,7 @@ impl LayoutEngine {
             workspace.columns.insert(insert_idx, column);
             workspace.focused_column_idx = insert_idx;
         }
-
+        
         self.recenter_camera(false);
     }
 
@@ -283,6 +481,9 @@ impl LayoutEngine {
             let ws = &mut self.workspaces[ws_idx];
             let col = &mut ws.columns[col_idx];
             col.windows.remove(win_idx);
+
+            // Remove from Depth ordering if present
+            self.windows.retain(|&w_id| w_id != id);
 
             if col.windows.is_empty() {
                 // Remove empty column
@@ -493,30 +694,68 @@ impl LayoutEngine {
         }
     }
 
-    /// Computes the visual bounding box of a window by its ID.
-    /// Returns `Option<(x, y, width, height)>` in global coordinate system.
     pub fn get_window_rect(&self, id: WindowId) -> Option<(f32, f32, f32, f32)> {
         for (ws_idx, ws) in self.workspaces.iter().enumerate() {
             if let Some((col_idx, _win_idx)) = ws.find_window(id) {
+                if self.tiling_mode == TilingMode::Overview {
+                    let scale = 0.45_f32;
+                    let spacing = 40.0_f32;
+                    
+                    let (base_x, base_y, base_w, base_h) = if ws.columns.len() == 1 {
+                        (
+                            self.outer_margin,
+                            self.outer_margin,
+                            self.viewport.width - 2.0 * self.outer_margin,
+                            self.viewport.height - 2.0 * self.outer_margin,
+                        )
+                    } else {
+                        let positions = self.column_positions(ws_idx);
+                        let col_x = positions[col_idx];
+                        let col = &ws.columns[col_idx];
+                        let col_width = col.width;
+                        (
+                            col_x,
+                            self.outer_margin,
+                            col_width,
+                            self.viewport.height - 2.0 * self.outer_margin,
+                        )
+                    };
+                    
+                    let x = base_x;
+                    let y = (ws_idx as f32 * (self.viewport.height + spacing / scale)) + base_y;
+                    let w = base_w;
+                    let h = base_h;
+                    return Some((x, y, w, h));
+                }
+
+                if self.tiling_mode == TilingMode::Depth {
+                    let ws_y = ws_idx as f32 * self.viewport.height;
+                    let x = self.outer_margin;
+                    let y = ws_y + self.outer_margin;
+                    let w = self.viewport.width - 2.0 * self.outer_margin;
+                    let h = self.viewport.height - 2.0 * self.outer_margin;
+                    return Some((x, y, w, h));
+                }
+
+                let ws_y = ws_idx as f32 * self.viewport.height;
+
+                if ws.columns.len() == 1 {
+                    let x = self.outer_margin;
+                    let y = ws_y + self.outer_margin;
+                    let w = self.viewport.width - 2.0 * self.outer_margin;
+                    let h = self.viewport.height - 2.0 * self.outer_margin;
+                    return Some((x, y, w, h));
+                }
+
                 let positions = self.column_positions(ws_idx);
                 let col_x = positions[col_idx];
                 let col = &ws.columns[col_idx];
-                
-                // If it's a tabbed group, only the active window gets rendered fully.
-                // Non-active windows are stacked (we can still report their dimensions,
-                // but let's assume standard window geometry matches the column's).
                 let col_width = col.width;
                 
-                let ws_y = ws_idx as f32 * self.viewport.height;
-                
-                // Visual window geometry within its grid slot (applying outer margins)
-                let x = col_x + self.outer_margin / 2.0;
+                let x = col_x;
                 let y = ws_y + self.outer_margin;
-                let w = col_width - self.outer_margin;
+                let w = col_width;
                 let h = self.viewport.height - 2.0 * self.outer_margin;
-
-                // Adjust for tabs: if it's tabbed, we only render the active tab,
-                // or we could report special geometry. For now, they occupy the same space.
                 return Some((x, y, w, h));
             }
         }
@@ -573,17 +812,17 @@ mod tests {
         // Col 2: 530.0 + 500.0 + 10.0 = 1040.0, width = 500.0
         let positions = engine.column_positions(0);
         assert_eq!(positions[0], 20.0);
-        assert_eq!(positions[1], 530.0);
-        assert_eq!(positions[2], 1040.0);
+        assert_eq!(positions[1], 505.0);
+        assert_eq!(positions[2], 990.0);
 
-        // Center on Col 2: target_x = 1040.0 + 250.0 - 500.0 = 790.0
-        assert_eq!(engine.viewport.target_x, 790.0);
+        // Center on Col 2: target_x = 990.0 + 237.5 - 500.0 = 727.5
+        assert_eq!(engine.viewport.target_x, 727.5);
 
         // Move left (to W2, index 1)
         engine.focus_left();
         assert_eq!(engine.active_workspace().focused_column_idx, 1);
-        // Center on Col 1: target_x = 530.0 + 250.0 - 500.0 = 280.0
-        assert_eq!(engine.viewport.target_x, 280.0);
+        // Center on Col 1: target_x = 505.0 + 237.5 - 500.0 = 242.5
+        assert_eq!(engine.viewport.target_x, 242.5);
     }
 
     #[test]
@@ -683,10 +922,9 @@ mod tests {
         assert_eq!(active_ws.columns[0].windows[1].id, w3); // Browser
         assert_eq!(active_ws.columns[1].windows[0].id, w1); // Terminal
 
-        // 9. Verify camera target position centered on Column 0 (width = 500)
-        // Col 0: x = 20.0, w = 500.0. Center of Col 0 = 20.0 + 250.0 = 270.0.
-        // Viewport width = 1000. target_x = 270.0 - 500.0 = -230.0.
-        assert_eq!(engine.viewport.target_x, -230.0);
+        // 9. Verify camera target position centered on Column 0
+        // Because the columns fit within the viewport (total width <= 1000), target_x is locked to 0.0.
+        assert_eq!(engine.viewport.target_x, 0.0);
     }
 
     #[test]
@@ -726,5 +964,120 @@ mod tests {
         // Tab up switches to index 1 (W2)
         engine.focus_tab_up();
         assert_eq!(engine.active_workspace().columns[0].focused_window_idx, 1);
+    }
+
+    #[test]
+    fn test_depth_scrolling() {
+        let mut engine = LayoutEngine::new(1000.0, 600.0, 10.0, 20.0, 5);
+        engine.tiling_mode = TilingMode::Depth;
+        engine.scroll_sensitivity = 0.5; // override sensitivity
+
+        let w1 = WindowId(1);
+        let w2 = WindowId(2);
+        let w3 = WindowId(3);
+
+        engine.spawn_window(w1, "W1".to_string());
+        engine.spawn_window(w2, "W2".to_string());
+        engine.spawn_window(w3, "W3".to_string());
+
+        // We have 3 windows. Maximum progress is saturating_sub(1) = 2.0.
+        // Scroll forward: delta = 1.0. With sensitivity 0.5, progress should change by 0.5.
+        engine.scroll_z(1.0);
+        assert_eq!(engine.depth_scroll_progress, 0.5);
+
+        // Scroll again by 4.0. Clamped to 2.0.
+        engine.scroll_z(4.0);
+        assert_eq!(engine.depth_scroll_progress, 2.0);
+
+        // Check depth transforms when progress is 1.0.
+        engine.depth_scroll_progress = 1.0;
+        let transforms = engine.depth_transforms();
+
+        // 3 windows, so 3 transforms.
+        assert_eq!(transforms.len(), 3);
+
+        // Under progress 1.0:
+        // Distances:
+        // W1 (idx 0): dist = 0 - 1 = -1.0. (zoomed past, scale = 1.5, opacity = 0.0)
+        // W2 (idx 1): dist = 1 - 1 = 0.0. (active foreground, scale = 1.0, opacity = 1.0)
+        // W3 (idx 2): dist = 2 - 1 = 1.0. (background, scale = 0.8, opacity = 0.6)
+        //
+        // Distance sorting descending order:
+        // dist_b > dist_a =>
+        // dist_a:
+        // W3: 1.0 (furthest back, rendered first)
+        // W2: 0.0 (active, rendered second)
+        // W1: -1.0 (closest/zoomed past, rendered third)
+        //
+        // Let's verify the order.
+        assert_eq!(transforms[0].0, w3); // W3 first
+        assert_eq!(transforms[1].0, w2); // W2 second
+        assert_eq!(transforms[2].0, w1); // W1 third
+
+        // Verify active flag
+        assert_eq!(transforms[0].1.is_active, false); // W3
+        assert_eq!(transforms[1].1.is_active, true);  // W2
+        assert_eq!(transforms[2].1.is_active, false); // W1
+
+        // Verify transforms
+        assert!((transforms[0].1.scale - 0.8).abs() < 1e-5);
+        assert!((transforms[1].1.scale - 1.0).abs() < 1e-5);
+        assert!((transforms[2].1.scale - 1.5).abs() < 1e-5);
+
+        assert!((transforms[0].1.opacity - 0.6).abs() < 1e-5);
+        assert!((transforms[1].1.opacity - 1.0).abs() < 1e-5);
+        assert!((transforms[2].1.opacity - 0.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_overview_mode() {
+        let mut engine = LayoutEngine::new(1000.0, 600.0, 10.0, 20.0, 5);
+        engine.tiling_mode = TilingMode::Overview;
+
+        let w1 = WindowId(1);
+        let w2 = WindowId(2);
+        let w3 = WindowId(3);
+
+        // Spawn w1 on active workspace 0
+        // It is alone in the viewport/workspace, so it fullscreens.
+        engine.spawn_window(w1, "W1".to_string());
+        
+        // Switch active workspace to 1 and spawn w2 and w3
+        // Workspace 1 has 2 windows (occupied), so they tile next to each other at half-size.
+        engine.active_workspace_idx = 1;
+        engine.spawn_window(w2, "W2".to_string());
+        engine.spawn_window(w3, "W3".to_string());
+
+        // Verify window 1 rect (workspace 0) - should be fullscreen
+        let rect1 = engine.get_window_rect(w1).unwrap();
+        assert!((rect1.0 - 20.0).abs() < 1e-5);
+        assert!((rect1.1 - 20.0).abs() < 1e-5);
+        assert!((rect1.2 - 960.0).abs() < 1e-5);
+        assert!((rect1.3 - 560.0).abs() < 1e-5);
+
+        // Verify window 2 rect (workspace 1) - should be half size next
+        let rect2 = engine.get_window_rect(w2).unwrap();
+        assert!((rect2.0 - 20.0).abs() < 1e-5);
+        assert!((rect2.1 - 708.88889).abs() < 1e-5);
+        assert!((rect2.2 - 475.0).abs() < 1e-5);
+        assert!((rect2.3 - 560.0).abs() < 1e-5);
+
+        // Verify window 3 rect (workspace 1) - should be half size next
+        let rect3 = engine.get_window_rect(w3).unwrap();
+        assert!((rect3.0 - 505.0).abs() < 1e-5);
+        assert!((rect3.1 - 708.88889).abs() < 1e-5);
+        assert!((rect3.2 - 475.0).abs() < 1e-5);
+        assert!((rect3.3 - 560.0).abs() < 1e-5);
+
+        // Verify camera recentering for active workspace 1
+        engine.recenter_camera(true);
+        assert!((engine.viewport.target_y - 145.0).abs() < 1e-5);
+        assert!((engine.viewport.target_x - (-165.875)).abs() < 1e-5);
+
+        // Verify camera recentering for active workspace 0
+        engine.active_workspace_idx = 0;
+        engine.recenter_camera(true);
+        assert!((engine.viewport.target_y - (-165.0)).abs() < 1e-5);
+        assert!((engine.viewport.target_x - (-275.0)).abs() < 1e-5);
     }
 }
