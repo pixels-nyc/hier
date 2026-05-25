@@ -48,6 +48,7 @@ if [ "$SOFTWARE_MODE" -eq 1 ] || [ -n "$LIBGL_ALWAYS_SOFTWARE" ]; then
   BWRAP_ARGS+=(--setenv LIBGL_ALWAYS_SOFTWARE 1)
 else
   echo "[Sandbox] Hardware GPU/DRI acceleration and Shared Memory enabled."
+  echo "[Sandbox] Tip: If GPU driver errors occur inside sandbox (e.g. libEGL / VK_ERROR), restart with --software"
   BWRAP_ARGS+=(--dev-bind-try /dev/dri /dev/dri --bind-try /dev/shm /dev/shm)
 fi
 
