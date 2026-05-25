@@ -520,6 +520,32 @@ fn find_terminal_cmd() -> String {
                 }
                 Ok(())
             }
+            "focus-workspace-up" | "focus_workspace_up" => {
+                self.layout_engine.focus_workspace_up();
+                let win_id = self.layout_engine.active_workspace().focused_column()
+                    .and_then(|col| col.focused_window().map(|w| w.id));
+                let surface = win_id
+                    .and_then(|id| self.windows.get(&id))
+                    .and_then(|w| w.wl_surface().map(|c| c.into_owned()));
+                if let Some(surface) = surface {
+                    self.set_keyboard_focus(Some(surface));
+                }
+                self.reposition_windows();
+                Ok(())
+            }
+            "focus-workspace-down" | "focus_workspace_down" => {
+                self.layout_engine.focus_workspace_down();
+                let win_id = self.layout_engine.active_workspace().focused_column()
+                    .and_then(|col| col.focused_window().map(|w| w.id));
+                let surface = win_id
+                    .and_then(|id| self.windows.get(&id))
+                    .and_then(|w| w.wl_surface().map(|c| c.into_owned()));
+                if let Some(surface) = surface {
+                    self.set_keyboard_focus(Some(surface));
+                }
+                self.reposition_windows();
+                Ok(())
+            }
             "move-left" | "move_left" => {
                 self.layout_engine.move_column_left();
                 self.reposition_windows();
@@ -829,6 +855,34 @@ fn find_terminal_cmd() -> String {
                     .as_millis() as u32;
 
                 let pointer = self.seat.get_pointer().unwrap();
+                let pos = pointer.current_location();
+
+                // Find focus surface under pointer coordinate in a separate block to satisfy borrow checker
+                let (focus, surface) = {
+                    let under = self.space.element_under(pos);
+                    let focus = under.as_ref().and_then(|(win, local_pos)| {
+                        win.surface_under(
+                            local_pos.to_f64(),
+                            WindowSurfaceType::ALL,
+                        )
+                        .map(|(surface, surface_local_pos)| {
+                            (surface.clone(), surface_local_pos.to_f64())
+                        })
+                    });
+                    let surface = under.and_then(|(win, _)| win.wl_surface().map(|c| c.into_owned()));
+                    (focus, surface)
+                };
+
+                pointer.motion(
+                    self,
+                    focus,
+                    &smithay::input::pointer::MotionEvent {
+                        location: pos,
+                        time,
+                        serial,
+                    },
+                );
+
                 pointer.button(
                     self,
                     &smithay::input::pointer::ButtonEvent {
@@ -841,8 +895,6 @@ fn find_terminal_cmd() -> String {
                 pointer.frame(self);
 
                 if state == ButtonState::Pressed {
-                    let pos = pointer.current_location();
-                    
                     if self.layout_engine.tiling_mode == crate::layout::TilingMode::Overview {
                         if let Some(win_id) = self.window_under_pointer(pos) {
                             self.focus_window_by_id(win_id);
@@ -853,8 +905,6 @@ fn find_terminal_cmd() -> String {
                         }
                     }
                     
-                    let surface = self.space.element_under(pos)
-                        .and_then(|(win, _)| win.wl_surface().map(|c| c.into_owned()));
                     if let Some(surface) = surface {
                         self.set_keyboard_focus(Some(surface));
                     }
