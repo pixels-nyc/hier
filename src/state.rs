@@ -2059,6 +2059,39 @@ fn find_terminal_cmd() -> String {
                 }
                 format!("{}\n", lines.join("\n"))
             }
+            "set_spring" | "set-spring" => {
+                if parts.len() < 4 {
+                    return "error: set_spring requires <camera|window|overview> <stiffness> <damping>\n".to_string();
+                }
+                let target = parts[1];
+                let stiffness = match parts[2].parse::<f32>() {
+                    Ok(val) => val,
+                    Err(_) => return "error: invalid stiffness value\n".to_string(),
+                };
+                let damping = match parts[3].parse::<f32>() {
+                    Ok(val) => val,
+                    Err(_) => return "error: invalid damping value\n".to_string(),
+                };
+
+                match target {
+                    "camera" => {
+                        self.layout_engine.camera_spring.stiffness = stiffness;
+                        self.layout_engine.camera_spring.damping = damping;
+                        "ok\n".to_string()
+                    }
+                    "window" => {
+                        self.layout_engine.window_spring.stiffness = stiffness;
+                        self.layout_engine.window_spring.damping = damping;
+                        "ok\n".to_string()
+                    }
+                    "overview" => {
+                        self.layout_engine.overview_spring.stiffness = stiffness;
+                        self.layout_engine.overview_spring.damping = damping;
+                        "ok\n".to_string()
+                    }
+                    _ => "error: unknown spring target (must be camera, window, or overview)\n".to_string(),
+                }
+            }
             "reset_telemetry" | "reset-telemetry" => {
                 self.frame_times.clear();
                 self.stutter_count = 0;

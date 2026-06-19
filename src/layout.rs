@@ -193,7 +193,9 @@ pub struct LayoutEngine {
     pub workspaces: Vec<Workspace>,
     pub active_workspace_idx: usize,
     pub viewport: Viewport,
-    pub spring: Spring,
+    pub camera_spring: Spring,
+    pub window_spring: Spring,
+    pub overview_spring: Spring,
     /// Spacing between adjacent columns.
     pub gap: f32,
     /// Margin between windows and the edge of the physical screen.
@@ -234,11 +236,40 @@ impl LayoutEngine {
             .and_then(|val| val.parse::<f32>().ok())
             .unwrap_or(0.1_f32);
 
+        let camera_stiffness = std::env::var("HIER_CAMERA_STIFFNESS")
+            .ok()
+            .and_then(|val| val.parse::<f32>().ok())
+            .unwrap_or(170.0);
+        let camera_damping = std::env::var("HIER_CAMERA_DAMPING")
+            .ok()
+            .and_then(|val| val.parse::<f32>().ok())
+            .unwrap_or(26.0);
+
+        let window_stiffness = std::env::var("HIER_WINDOW_STIFFNESS")
+            .ok()
+            .and_then(|val| val.parse::<f32>().ok())
+            .unwrap_or(240.0);
+        let window_damping = std::env::var("HIER_WINDOW_DAMPING")
+            .ok()
+            .and_then(|val| val.parse::<f32>().ok())
+            .unwrap_or(30.0);
+
+        let overview_stiffness = std::env::var("HIER_OVERVIEW_STIFFNESS")
+            .ok()
+            .and_then(|val| val.parse::<f32>().ok())
+            .unwrap_or(150.0);
+        let overview_damping = std::env::var("HIER_OVERVIEW_DAMPING")
+            .ok()
+            .and_then(|val| val.parse::<f32>().ok())
+            .unwrap_or(24.0);
+
         Self {
             workspaces,
             active_workspace_idx: 0,
             viewport: Viewport::new(viewport_width, viewport_height),
-            spring: Spring::default(),
+            camera_spring: Spring::new(camera_stiffness, camera_damping),
+            window_spring: Spring::new(window_stiffness, window_damping),
+            overview_spring: Spring::new(overview_stiffness, overview_damping),
             gap,
             outer_margin,
             default_width_fraction: 1.0,
@@ -257,7 +288,7 @@ impl LayoutEngine {
 
     /// Ticks the spring physics for the camera positioning and workspace scaling.
     pub fn tick(&mut self, dt: f32) {
-        let (nx, vx) = self.spring.update(
+        let (nx, vx) = self.camera_spring.update(
             self.viewport.x,
             self.viewport.velocity_x,
             self.viewport.target_x,
@@ -266,7 +297,7 @@ impl LayoutEngine {
         self.viewport.x = nx;
         self.viewport.velocity_x = vx;
 
-        let (ny, vy) = self.spring.update(
+        let (ny, vy) = self.camera_spring.update(
             self.viewport.y,
             self.viewport.velocity_y,
             self.viewport.target_y,
@@ -275,7 +306,7 @@ impl LayoutEngine {
         self.viewport.y = ny;
         self.viewport.velocity_y = vy;
 
-        let (ns, vs) = self.spring.update(
+        let (ns, vs) = self.overview_spring.update(
             self.current_overview_scale,
             self.overview_scale_velocity,
             self.target_overview_scale,
@@ -322,19 +353,19 @@ impl LayoutEngine {
                                     win.anim_initialized = true;
                                 }
 
-                                let (nx, vx) = self.spring.update(win.anim_x, win.vel_x, target_x, dt);
+                                let (nx, vx) = self.window_spring.update(win.anim_x, win.vel_x, target_x, dt);
                                 win.anim_x = nx;
                                 win.vel_x = vx;
 
-                                let (ny, vy) = self.spring.update(win.anim_y, win.vel_y, target_y, dt);
+                                let (ny, vy) = self.window_spring.update(win.anim_y, win.vel_y, target_y, dt);
                                 win.anim_y = ny;
                                 win.vel_y = vy;
 
-                                let (nw, vw) = self.spring.update(win.anim_w, win.vel_w, target_w, dt);
+                                let (nw, vw) = self.window_spring.update(win.anim_w, win.vel_w, target_w, dt);
                                 win.anim_w = nw;
                                 win.vel_w = vw;
 
-                                let (nh, vh) = self.spring.update(win.anim_h, win.vel_h, target_h, dt);
+                                let (nh, vh) = self.window_spring.update(win.anim_h, win.vel_h, target_h, dt);
                                 win.anim_h = nh;
                                 win.vel_h = vh;
                             }
