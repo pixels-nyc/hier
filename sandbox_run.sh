@@ -76,6 +76,7 @@ BWRAP_ARGS=(
   --ro-bind /lib64 /lib64
   --ro-bind /bin /bin
   --ro-bind-try /etc/fonts /etc/fonts
+  --ro-bind-try /etc/resolv.conf /etc/resolv.conf
   --ro-bind-try /usr/share/fonts /usr/share/fonts
   --dev /dev
   --proc /proc
