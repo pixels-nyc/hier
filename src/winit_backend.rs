@@ -1229,6 +1229,8 @@ pub fn run_winit_compositor(sandbox: bool) -> Result<(), Box<dyn std::error::Err
         let dt = now.duration_since(last_tick).as_secs_f32();
         last_tick = now;
 
+        state.record_frame_time(dt);
+
         state.layout_engine.tick(dt);
 
         // Update HUD state

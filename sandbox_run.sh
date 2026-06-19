@@ -97,8 +97,11 @@ BWRAP_ARGS+=(
   --bind-try /dev/shm /dev/shm
   --bind "$SANDBOX_DIR" "$SANDBOX_DIR"
   --bind "$HOST_XDG_RUNTIME_DIR/$HOST_WAYLAND_DISPLAY" "$SANDBOX_DIR/$HOST_WAYLAND_DISPLAY"
+  --bind-try "$HOST_XDG_RUNTIME_DIR/pipewire-0" "$SANDBOX_DIR/pipewire-0"
+  --bind-try "$HOST_XDG_RUNTIME_DIR/pulse" "$SANDBOX_DIR/pulse"
   --setenv WAYLAND_DISPLAY "$HOST_WAYLAND_DISPLAY"
   --setenv XDG_RUNTIME_DIR "$SANDBOX_DIR"
+  --setenv PULSE_SERVER "unix:$SANDBOX_DIR/pulse/native"
   --setenv HIER_HOST_TRANSFORM "${HIER_HOST_TRANSFORM:-Normal}"
   --unshare-all
 )

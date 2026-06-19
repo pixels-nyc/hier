@@ -89,6 +89,9 @@ pub struct State {
     pub depth_switcher_previous_mode: Option<crate::layout::TilingMode>,
     pub pending_restores: Vec<PendingRestore>,
     pub config_binds: HashMap<(bool, bool, bool, bool, u32), String>,
+    pub frame_times: Vec<f32>,
+    pub stutter_count: u32,
+    pub stutter_threshold_ms: f32,
     pub sandbox: bool,
 }
 
@@ -400,6 +403,12 @@ impl State {
             hud_previous_mode: None,
             pending_restores: Vec::new(),
             config_binds,
+            frame_times: Vec::with_capacity(200),
+            stutter_count: 0,
+            stutter_threshold_ms: std::env::var("HIER_STUTTER_THRESHOLD_MS")
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok())
+                .unwrap_or(18.0),
             sandbox,
         };
 
@@ -413,6 +422,17 @@ impl State {
         }
 
         state
+    }
+
+    pub fn record_frame_time(&mut self, dt_secs: f32) {
+        let dt_ms = dt_secs * 1000.0;
+        if dt_ms > self.stutter_threshold_ms {
+            self.stutter_count += 1;
+        }
+        self.frame_times.push(dt_ms);
+        if self.frame_times.len() > 200 {
+            self.frame_times.remove(0);
+        }
     }
 
     pub fn forward_to_child(&self, cmd: &str) -> bool {
@@ -2039,6 +2059,64 @@ fn find_terminal_cmd() -> String {
                 }
                 format!("{}\n", lines.join("\n"))
             }
+            "reset_telemetry" | "reset-telemetry" => {
+                self.frame_times.clear();
+                self.stutter_count = 0;
+                "ok\n".to_string()
+            }
+            "get_telemetry" | "get-telemetry" => {
+                let n = self.frame_times.len();
+                let (min, max, mean, stddev) = if n == 0 {
+                    (0.0, 0.0, 0.0, 0.0)
+                } else {
+                    let mut min = self.frame_times[0];
+                    let mut max = self.frame_times[0];
+                    let mut sum = 0.0;
+                    for &t in &self.frame_times {
+                        if t < min { min = t; }
+                        if t > max { max = t; }
+                        sum += t;
+                    }
+                    let mean = sum / (n as f32);
+                    let stddev = if n < 2 {
+                        0.0
+                    } else {
+                        let mut sum_sq_diff = 0.0;
+                        for &t in &self.frame_times {
+                            let diff = t - mean;
+                            sum_sq_diff += diff * diff;
+                        }
+                        (sum_sq_diff / (n as f32)).sqrt()
+                    };
+                    (min, max, mean, stddev)
+                };
+
+                #[derive(serde::Serialize)]
+                struct TelemetryResponse<'a> {
+                    min_ms: f32,
+                    max_ms: f32,
+                    mean_ms: f32,
+                    stddev_ms: f32,
+                    stutter_count: u32,
+                    total_frames: usize,
+                    frame_times: &'a [f32],
+                }
+
+                let resp = TelemetryResponse {
+                    min_ms: min,
+                    max_ms: max,
+                    mean_ms: mean,
+                    stddev_ms: stddev,
+                    stutter_count: self.stutter_count,
+                    total_frames: n,
+                    frame_times: &self.frame_times,
+                };
+
+                match serde_json::to_string(&resp) {
+                    Ok(json_str) => format!("{}\n", json_str),
+                    Err(e) => format!("error: failed to serialize telemetry: {}\n", e),
+                }
+            }
             "save_session" | "save-session" => {
                 match self.save_session_internal() {
                     Ok(path) => format!("ok: session saved to {}\n", path),
@@ -2317,10 +2395,16 @@ fn find_terminal_cmd() -> String {
                         let mut rgb_data = vec![30u8; width * height * 3];
                         let mut rgba_data = vec![30u8; width * height * 4];
                         
+                        let title_lower = title.to_lowercase();
+                        let is_terminal = title_lower.contains("terminal") || title_lower.contains("ghostty") || title_lower.contains("alacritty");
+                        let is_browser = title_lower.contains("chrome") || title_lower.contains("browser") || title_lower.contains("firefox") || title_lower.contains("epiphany");
+
                         for py in 0..height {
                             for px in 0..width {
                                 let idx3 = (py * width + px) * 3;
                                 let idx4 = (py * width + px) * 4;
+                                
+                                // Draw 4px border (Dodger Blue: (30, 144, 255))
                                 if py < 4 || py >= height - 4 || px < 4 || px >= width - 4 {
                                     rgb_data[idx3] = 30;
                                     rgb_data[idx3 + 1] = 144;
@@ -2329,11 +2413,72 @@ fn find_terminal_cmd() -> String {
                                     rgba_data[idx4] = 30;
                                     rgba_data[idx4 + 1] = 144;
                                     rgba_data[idx4 + 2] = 255;
-                                } else {
-                                    rgba_data[idx4] = 30;
-                                    rgba_data[idx4 + 1] = 30;
-                                    rgba_data[idx4 + 2] = 30;
+                                    rgba_data[idx4 + 3] = 255;
+                                    continue;
                                 }
+
+                                // Interior dynamic elements
+                                let (r, g, b) = if is_terminal {
+                                    // Terminal template
+                                    if py >= height * 5 / 100 && py < height * 10 / 100 && px >= width * 5 / 100 && px < width * 10 / 100 {
+                                        // Prompt: green block
+                                        (50, 205, 50)
+                                    } else if py >= height * 5 / 100 && py < height * 10 / 100 && px >= width * 12 / 100 && px < width * 18 / 100 {
+                                        // Prompt cursor: green block
+                                        (50, 205, 50)
+                                    } else if (py == height * 30 / 100 || py == height * 50 / 100 || py == height * 70 / 100) && px >= width * 5 / 100 && px < width * 95 / 100 {
+                                        // stdout lines: light gray
+                                        (180, 180, 180)
+                                    } else {
+                                        // dark gray background
+                                        (15, 15, 15)
+                                    }
+                                } else if is_browser {
+                                    // Browser template
+                                    if py >= height * 5 / 100 && py < height * 15 / 100 && px >= width * 5 / 100 && px < width * 95 / 100 {
+                                        // Address bar container
+                                        if py >= height * 7 / 100 && py < height * 13 / 100 && px >= width * 15 / 100 && px < width * 85 / 100 {
+                                            // URL Input Box: White
+                                            (255, 255, 255)
+                                        } else {
+                                            // Container gray
+                                            (210, 210, 210)
+                                        }
+                                    } else if py >= height * 20 / 100 && py < height * 90 / 100 && px >= width * 5 / 100 && px < width * 95 / 100 {
+                                        // Web page Card: Light sky blue
+                                        (135, 206, 250)
+                                    } else {
+                                        // browser background: Off-white
+                                        (240, 240, 240)
+                                    }
+                                } else {
+                                    // General app template (default)
+                                    if py >= 4 && py < height * 10 / 100 && px >= 4 && px < width - 4 {
+                                        // Title bar area (dark gray)
+                                        (30, 30, 30)
+                                    } else if py >= height * 80 / 100 && py < height * 90 / 100 {
+                                        if px >= width * 35 / 100 && px < width * 48 / 100 {
+                                            // OK button: light gray
+                                            (180, 180, 180)
+                                        } else if px >= width * 52 / 100 && px < width * 65 / 100 {
+                                            // Cancel button: mid gray
+                                            (100, 100, 100)
+                                        } else {
+                                            (45, 45, 45)
+                                        }
+                                    } else {
+                                        // medium gray background
+                                        (45, 45, 45)
+                                    }
+                                };
+
+                                rgb_data[idx3] = r;
+                                rgb_data[idx3 + 1] = g;
+                                rgb_data[idx3 + 2] = b;
+                                
+                                rgba_data[idx4] = r;
+                                rgba_data[idx4 + 1] = g;
+                                rgba_data[idx4 + 2] = b;
                                 rgba_data[idx4 + 3] = 255;
                             }
                         }

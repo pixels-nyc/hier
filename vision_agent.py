@@ -71,6 +71,97 @@ def verify_window_border(width, height, pixel_bytes):
         print(f"❌ Visual Border Check: FAILED (Expected {expected_color}, got [{r},{g},{b}])")
         return False
 
+def verify_window_interior(width, height, pixel_bytes, win_title):
+    title_lower = win_title.lower()
+    is_terminal = "terminal" in title_lower or "ghostty" in title_lower or "alacritty" in title_lower
+    is_browser = "chrome" in title_lower or "browser" in title_lower or "firefox" in title_lower or "epiphany" in title_lower
+    
+    print(f"Verifying window interior for '{win_title}' (is_terminal: {is_terminal}, is_browser: {is_browser})...")
+    
+    def get_pixel(px, py):
+        idx = (py * width + px) * 3
+        if idx + 2 >= len(pixel_bytes):
+            return None
+        return (pixel_bytes[idx], pixel_bytes[idx+1], pixel_bytes[idx+2])
+
+    if is_terminal:
+        # Check green prompt (at 7% of width, 7% of height)
+        px_prompt = int(width * 7 / 100)
+        py_prompt = int(height * 7 / 100)
+        color_prompt = get_pixel(px_prompt, py_prompt)
+        print(f"Terminal Prompt pixel color at ({px_prompt}, {py_prompt}): {color_prompt}")
+        if color_prompt != (50, 205, 50):
+            print(f"❌ Error: Terminal prompt color mismatch. Expected (50, 205, 50), got {color_prompt}")
+            return False
+            
+        # Check green cursor (at 15% of width, 7% of height)
+        px_cursor = int(width * 15 / 100)
+        py_cursor = int(height * 7 / 100)
+        color_cursor = get_pixel(px_cursor, py_cursor)
+        print(f"Terminal Cursor pixel color at ({px_cursor}, {py_cursor}): {color_cursor}")
+        if color_cursor != (50, 205, 50):
+            print(f"❌ Error: Terminal cursor color mismatch. Expected (50, 205, 50), got {color_cursor}")
+            return False
+            
+        # Check dark background (at 50% of width, 50% of height)
+        px_bg = int(width * 50 / 100)
+        py_bg = int(height * 50 / 100)
+        color_bg = get_pixel(px_bg, py_bg)
+        print(f"Terminal Background pixel color at ({px_bg}, {py_bg}): {color_bg}")
+        if color_bg != (15, 15, 15):
+            print(f"❌ Error: Terminal background color mismatch. Expected (15, 15, 15), got {color_bg}")
+            return False
+            
+    elif is_browser:
+        # Check off-white background (at 50% of width, 18% of height)
+        px_bg = int(width * 50 / 100)
+        py_bg = int(height * 18 / 100)
+        color_bg = get_pixel(px_bg, py_bg)
+        print(f"Browser Background pixel color at ({px_bg}, {py_bg}): {color_bg}")
+        if color_bg != (240, 240, 240):
+            print(f"❌ Error: Browser background color mismatch. Expected (240, 240, 240), got {color_bg}")
+            return False
+            
+        # Check URL input field white background (at 50% of width, 10% of height)
+        px_url = int(width * 50 / 100)
+        py_url = int(height * 10 / 100)
+        color_url = get_pixel(px_url, py_url)
+        print(f"Browser URL Input pixel color at ({px_url}, {py_url}): {color_url}")
+        if color_url != (255, 255, 255):
+            print(f"❌ Error: Browser URL input color mismatch. Expected (255, 255, 255), got {color_url}")
+            return False
+
+        # Check light sky blue web page card (at 50% of width, 50% of height)
+        px_card = int(width * 50 / 100)
+        py_card = int(height * 50 / 100)
+        color_card = get_pixel(px_card, py_card)
+        print(f"Browser Web Content pixel color at ({px_card}, {py_card}): {color_card}")
+        if color_card != (135, 206, 250):
+            print(f"❌ Error: Browser content card color mismatch. Expected (135, 206, 250), got {color_card}")
+            return False
+            
+    else:
+        # Check Title Bar dark gray (at 50% of width, 7% of height)
+        px_tb = int(width * 50 / 100)
+        py_tb = int(height * 7 / 100)
+        color_tb = get_pixel(px_tb, py_tb)
+        print(f"App Title Bar pixel color at ({px_tb}, {py_tb}): {color_tb}")
+        if color_tb != (30, 30, 30):
+            print(f"❌ Error: App title bar color mismatch. Expected (30, 30, 30), got {color_tb}")
+            return False
+            
+        # Check general background (at 50% of width, 50% of height)
+        px_bg = int(width * 50 / 100)
+        py_bg = int(height * 50 / 100)
+        color_bg = get_pixel(px_bg, py_bg)
+        print(f"App Background pixel color at ({px_bg}, {py_bg}): {color_bg}")
+        if color_bg != (45, 45, 45):
+            print(f"❌ Error: App background color mismatch. Expected (45, 45, 45), got {color_bg}")
+            return False
+            
+    print("✅ Visual Interior Check: PASSED!")
+    return True
+
 def main():
     print("=== PyTorch Vision Agent (Lightweight Native Fallback) ===")
     
@@ -80,9 +171,6 @@ def main():
         import torchvision
         print(f"PyTorch environment detected! Torch version: {torch.__version__}")
         print("Transforming PPM pixel bytes to tensor...")
-        # Conceptual tensor transformation for AI Vision detection:
-        # transform = torchvision.transforms.ToTensor()
-        # tensor_img = transform(parsed_img)
     except ImportError:
         print("Note: PyTorch/Torchvision not installed in current environment. Using native P6 PPM edge inspector.")
         
@@ -91,17 +179,23 @@ def main():
         print("No windows mapped. Please start a nested Wayland client first.")
         sys.exit(1)
         
-    # Get first window id
-    win_id = layout_info.split('\n')[0].split(':')[2]
+    # Get first window id and title
+    first_window = layout_info.split('\n')[0]
+    fields = first_window.split(':')
+    win_id = fields[2]
+    win_title = fields[5]
     
     capture_path = "/tmp/vision_capture.ppm"
-    print(f"Capturing window ID {win_id} to {capture_path}...")
+    print(f"Capturing window ID {win_id} ('{win_title}') to {capture_path}...")
     res = send_cmd(f"capture_window {win_id} {capture_path}")
     print(f"Response: {res.strip()}")
     
     # Parse and verify
     width, height, pixel_bytes = parse_ppm(capture_path)
-    if verify_window_border(width, height, pixel_bytes):
+    border_ok = verify_window_border(width, height, pixel_bytes)
+    interior_ok = verify_window_interior(width, height, pixel_bytes, win_title)
+    
+    if border_ok and interior_ok:
         print("=== RPA Vision Validation Successful ===")
     else:
         print("=== RPA Vision Validation Failed ===")

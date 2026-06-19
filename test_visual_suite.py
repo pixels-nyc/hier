@@ -10,6 +10,18 @@ import subprocess
 import json
 import base64
 import shutil
+import glob
+
+# Auto-detect NIRI_SOCKET if not present in environment
+if "NIRI_SOCKET" not in os.environ:
+    niri_sockets = glob.glob("/run/user/1000/niri.wayland-*.sock")
+    if niri_sockets:
+        os.environ["NIRI_SOCKET"] = niri_sockets[0]
+        print(f"[*] Dynamically set NIRI_SOCKET={niri_sockets[0]}")
+
+if "WAYLAND_DISPLAY" not in os.environ:
+    os.environ["WAYLAND_DISPLAY"] = "wayland-1"
+    print("[*] Dynamically set WAYLAND_DISPLAY=wayland-1")
 
 TEST_DIR = "/tmp/hier_visual_suite"
 REPORT_PATH = "/home/super/Work/rust-based-dev/niri-rebuild/visual_test_report.html"
@@ -183,6 +195,53 @@ def parse_window_rects(layout_str):
             continue
     return rects
 
+def check_telemetry_stutter(tc_name):
+    telemetry_raw = send_socket_cmd("get_telemetry").strip()
+    if not telemetry_raw:
+        return {
+            "win_id": None,
+            "description": "Verify transition frame telemetry (smoothness)",
+            "status": "WARNING",
+            "details": "No telemetry response received from control socket"
+        }
+    try:
+        data = json.loads(telemetry_raw)
+        stutter_count = data.get("stutter_count", 0)
+        frame_times = data.get("frame_times", [])
+        
+        # Calculate 95th percentile
+        p95 = 0.0
+        if frame_times:
+            sorted_times = sorted(frame_times)
+            idx = int(len(sorted_times) * 0.95)
+            idx = min(idx, len(sorted_times) - 1)
+            p95 = sorted_times[idx]
+            
+        mean = data.get("mean_ms", 0.0)
+        max_t = data.get("max_ms", 0.0)
+        
+        # Criteria: stutter_count <= 5 OR p95 < 35.0 (accommodating software rendering CPU limits)
+        status = "PASSED"
+        details = f"Stutters: {stutter_count}, Mean: {mean:.2f}ms, P95: {p95:.2f}ms, Max: {max_t:.2f}ms"
+        
+        if stutter_count > 5 and p95 >= 35.0:
+            status = "FAILED"
+            details = f"Stutter count ({stutter_count}) exceeds threshold and P95 ({p95:.2f}ms) >= 35ms"
+            
+        return {
+            "win_id": None,
+            "description": "Verify transition frame telemetry (smoothness)",
+            "status": status,
+            "details": details
+        }
+    except Exception as e:
+        return {
+            "win_id": None,
+            "description": "Verify transition frame telemetry (smoothness)",
+            "status": "WARNING",
+            "details": f"Failed to parse telemetry JSON: {e}"
+        }
+
 def main():
     print("==========================================================")
     # 1. Setup workspace
@@ -192,18 +251,20 @@ def main():
     
     # 2. Cleanup compositor
     print("[*] Cleaning up existing compositor instances...")
-    subprocess.run(["pkill", "-f", "target/debug/hier"])
+    subprocess.run(["pkill", "-f", "target/release/hier"])
     if os.path.exists(SOCKET_PATH):
         os.remove(SOCKET_PATH)
         
     # 3. Launch compositor in sandbox
     print("[*] Launching sandbox compositor...")
     env = os.environ.copy()
+    if "WAYLAND_DISPLAY" not in env:
+        env["WAYLAND_DISPLAY"] = "wayland-1"
     env["HIER_SANDBOX"] = "1"
     env["LIBGL_ALWAYS_SOFTWARE"] = "1"
     
     comp_proc = subprocess.Popen(
-        ["./target/debug/hier"],
+        ["./target/release/hier"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         env=env
@@ -346,6 +407,9 @@ def main():
             case_id = tc["id"]
             print(f"\n[*] Running Test Case: {tc['name']}...")
             
+            # Reset telemetry stats before running the transition
+            send_socket_cmd("reset_telemetry")
+            
             # Setup layout
             if tc["setup_cmd"]:
                 send_socket_cmd(tc["setup_cmd"])
@@ -397,8 +461,11 @@ def main():
             print(f"  Screenshot physical size: {ppm_w}x{ppm_h} (Scale Factor: {layout_scale:.2f})")
             
             assertions = []
-            case_failed = False
-            failure_reason = ""
+            # Verify transition frame telemetry (smoothness)
+            telemetry_res = check_telemetry_stutter(tc["name"])
+            assertions.append(telemetry_res)
+            case_failed = (telemetry_res["status"] == "FAILED")
+            failure_reason = telemetry_res["details"] if case_failed else ""
             
             # Perform visual center color assertions for specified windows
             for win_id in tc["validate_windows"]:
