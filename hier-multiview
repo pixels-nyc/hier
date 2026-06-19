@@ -85,7 +85,7 @@ def parse_layout(layout_str: str):
     for line in lines:
         if not line or line.startswith("error:"):
             continue
-        parts = line.split(":", 5)
+        parts = line.split(":")
         if len(parts) < 6:
             continue
             
@@ -95,7 +95,10 @@ def parse_layout(layout_str: str):
             win_id = int(parts[2])
             is_focused = parts[3].lower() == "true"
             rect = parts[4] # x,y,w,h
-            title = parts[5]
+            if len(parts) >= 8:
+                title = ":".join(parts[5:-2])
+            else:
+                title = ":".join(parts[5:])
         except ValueError:
             continue
             

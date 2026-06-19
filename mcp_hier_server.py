@@ -203,6 +203,51 @@ def handle_tools_list():
             }
         },
         {
+            "name": "get_scrolling_position",
+            "description": "Get the scrolling position (column index, window tile index, and z-axis progress) of a specific window or the focused window.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "window_id": {
+                        "type": "integer",
+                        "description": "Optional window ID. If omitted, uses the currently focused window."
+                    },
+                    "display": {
+                        "type": "string",
+                        "description": "Optional Wayland display name."
+                    }
+                }
+            }
+        },
+        {
+            "name": "reposition_window",
+            "description": "Reposition a window to a specific workspace index, column index, and window tile index.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "window_id": {"type": "integer", "description": "The ID of the window to reposition."},
+                    "workspace_idx": {"type": "integer", "description": "The target workspace index."},
+                    "column_idx": {"type": "integer", "description": "The target column index within the workspace."},
+                    "tile_idx": {"type": "integer", "description": "The target window tile index within the column."},
+                    "display": {"type": "string", "description": "Optional Wayland display name."}
+                },
+                "required": ["window_id", "workspace_idx", "column_idx", "tile_idx"]
+            }
+        },
+        {
+            "name": "cut_window",
+            "description": "Perform Z-axis 'cut' window promotion: take a window out of a nested child display and place it in the parent compositor (Z) with custom access properties.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "child_display": {"type": "string", "description": "The nested child display name (e.g. 'wayland-2')."},
+                    "window_id": {"type": "integer", "description": "The ID of the window to cut/promote from the child compositor."},
+                    "display": {"type": "string", "description": "Optional parent display name (e.g. 'wayland-1')."}
+                },
+                "required": ["child_display", "window_id"]
+            }
+        },
+        {
             "name": "perform_action",
             "description": "Trigger a window layout action (e.g. focus-left, focus-right, focus-up, focus-down, toggle-tab, spawn-terminal, workspace-1, restore-nest-0, fresh-nest, quit).",
             "inputSchema": {
@@ -334,6 +379,34 @@ def handle_tools_call(name, args):
         res = send_command(display, "get_layout")
         return {
             "content": [{"type": "text", "text": res}]
+        }
+        
+    elif name == "get_scrolling_position":
+        win_id = args.get("window_id")
+        cmd = "get_scrolling_position"
+        if win_id is not None:
+            cmd = f"get_scrolling_position {win_id}"
+        res = send_command(display, cmd)
+        return {
+            "content": [{"type": "text", "text": res.strip()}]
+        }
+        
+    elif name == "reposition_window":
+        win_id = args["window_id"]
+        ws_idx = args["workspace_idx"]
+        col_idx = args["column_idx"]
+        tile_idx = args["tile_idx"]
+        res = send_command(display, f"reposition_window {win_id} {ws_idx} {col_idx} {tile_idx}")
+        return {
+            "content": [{"type": "text", "text": res.strip()}]
+        }
+        
+    elif name == "cut_window":
+        child_display = args["child_display"]
+        win_id = args["window_id"]
+        res = send_command(display, f"cut_window {child_display} {win_id}")
+        return {
+            "content": [{"type": "text", "text": res.strip()}]
         }
         
     elif name == "perform_action":

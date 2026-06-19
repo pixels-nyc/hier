@@ -11,6 +11,33 @@ pub struct WindowId(pub u32);
 pub struct Window {
     pub id: WindowId,
     pub title: String,
+    pub anim_x: f32,
+    pub anim_y: f32,
+    pub anim_w: f32,
+    pub anim_h: f32,
+    pub vel_x: f32,
+    pub vel_y: f32,
+    pub vel_w: f32,
+    pub vel_h: f32,
+    pub anim_initialized: bool,
+}
+
+impl Window {
+    pub fn new(id: WindowId, title: String) -> Self {
+        Self {
+            id,
+            title,
+            anim_x: 0.0,
+            anim_y: 0.0,
+            anim_w: 0.0,
+            anim_h: 0.0,
+            vel_x: 0.0,
+            vel_y: 0.0,
+            vel_w: 0.0,
+            vel_h: 0.0,
+            anim_initialized: false,
+        }
+    }
 }
 
 /// A container in the horizontal layout.
@@ -138,6 +165,21 @@ pub enum TilingMode {
     Overview,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum OverviewProgress {
+    Animation(f32),
+    Open,
+}
+
+impl OverviewProgress {
+    pub fn value(&self) -> f32 {
+        match self {
+            OverviewProgress::Animation(v) => *v,
+            OverviewProgress::Open => 1.0,
+        }
+    }
+}
+
 // Transform data for Depth mode card stack
 #[derive(Default, Debug, Clone, Copy)]
 pub struct DepthTransform {
@@ -170,6 +212,8 @@ pub struct LayoutEngine {
     pub target_overview_scale: f32,
     pub overview_scale_velocity: f32,
     pub underlying_tiling_mode: TilingMode,
+    pub overview_open: bool,
+    pub overview_progress: Option<OverviewProgress>,
 }
 
 impl LayoutEngine {
@@ -206,6 +250,8 @@ impl LayoutEngine {
             target_overview_scale: 1.0,
             overview_scale_velocity: 0.0,
             underlying_tiling_mode: TilingMode::Grid,
+            overview_open: false,
+            overview_progress: None,
         }
     }
 
@@ -237,6 +283,66 @@ impl LayoutEngine {
         );
         self.current_overview_scale = ns;
         self.overview_scale_velocity = vs;
+
+        // Dynamically compute the overview_progress enum based on the current scale value.
+        if self.overview_open {
+            let progress_val = ((1.0 - self.current_overview_scale) / 0.55).clamp(0.0, 1.0);
+            if (self.current_overview_scale - 0.45).abs() < 1e-3 {
+                self.overview_progress = Some(OverviewProgress::Open);
+            } else {
+                self.overview_progress = Some(OverviewProgress::Animation(progress_val));
+            }
+        } else {
+            let progress_val = ((1.0 - self.current_overview_scale) / 0.55).clamp(0.0, 1.0);
+            if (self.current_overview_scale - 1.0).abs() < 1e-3 {
+                self.overview_progress = None;
+            } else {
+                self.overview_progress = Some(OverviewProgress::Animation(progress_val));
+            }
+        }
+
+        // Gather all window IDs currently in workspaces
+        let window_ids: Vec<WindowId> = self.workspaces.iter()
+            .flat_map(|ws| ws.columns.iter())
+            .flat_map(|col| col.windows.iter())
+            .map(|win| win.id)
+            .collect();
+
+        for id in window_ids {
+            if let Some((target_x, target_y, target_w, target_h)) = self.get_window_rect(id) {
+                for ws in &mut self.workspaces {
+                    for col in &mut ws.columns {
+                        for win in &mut col.windows {
+                            if win.id == id {
+                                if !win.anim_initialized {
+                                    win.anim_x = target_x;
+                                    win.anim_y = target_y;
+                                    win.anim_w = target_w;
+                                    win.anim_h = target_h;
+                                    win.anim_initialized = true;
+                                }
+
+                                let (nx, vx) = self.spring.update(win.anim_x, win.vel_x, target_x, dt);
+                                win.anim_x = nx;
+                                win.vel_x = vx;
+
+                                let (ny, vy) = self.spring.update(win.anim_y, win.vel_y, target_y, dt);
+                                win.anim_y = ny;
+                                win.vel_y = vy;
+
+                                let (nw, vw) = self.spring.update(win.anim_w, win.vel_w, target_w, dt);
+                                win.anim_w = nw;
+                                win.vel_w = vw;
+
+                                let (nh, vh) = self.spring.update(win.anim_h, win.vel_h, target_h, dt);
+                                win.anim_h = nh;
+                                win.vel_h = vh;
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Resize the physical output dimensions.
@@ -371,7 +477,7 @@ impl LayoutEngine {
 
     /// of the active workspace and the active workspace's vertical offset.
     pub fn recenter_camera(&mut self, immediate: bool) {
-        if self.tiling_mode == TilingMode::Overview {
+        if self.overview_open {
             self.target_overview_scale = 0.45;
         } else {
             self.target_overview_scale = 1.0;
@@ -383,41 +489,11 @@ impl LayoutEngine {
 
         let active_idx = self.active_workspace_idx;
         
-        if self.tiling_mode == TilingMode::Overview {
-            let scale = 0.45_f32;
-            let spacing = 40.0_f32;
-            
-            // Vertical target centered on active workspace stack
-            let target_y = (active_idx as f32 * (self.viewport.height * scale + spacing))
-                + (self.viewport.height * scale / 2.0) - (self.viewport.height / 2.0);
-            self.viewport.target_y = target_y;
-            if immediate {
-                self.viewport.y = target_y;
-                self.viewport.velocity_y = 0.0;
-            }
-
-            // Horizontal target centered on active workspace's focused column
-            let positions = self.column_positions(active_idx);
-            let workspace = &self.workspaces[active_idx];
-            
-            let target_x = if workspace.columns.is_empty() {
-                - (self.viewport.width / 2.0)
-            } else if workspace.columns.len() == 1 {
-                (self.viewport.width / 2.0) * scale - (self.viewport.width / 2.0)
-            } else {
-                let col_idx = workspace.focused_column_idx;
-                let col_x = positions[col_idx];
-                let col_w = workspace.columns[col_idx].width;
-                (col_x + col_w / 2.0) * scale - (self.viewport.width / 2.0)
-            };
-            
-            self.viewport.target_x = target_x;
-            if immediate {
-                self.viewport.x = target_x;
-                self.viewport.velocity_x = 0.0;
-            }
-            return;
-        }
+        let rec_mode = if self.tiling_mode == TilingMode::Overview {
+            &self.underlying_tiling_mode
+        } else {
+            &self.tiling_mode
+        };
 
         // Vertical workspace target offset
         let target_y = active_idx as f32 * self.viewport.height;
@@ -427,7 +503,7 @@ impl LayoutEngine {
             self.viewport.velocity_y = 0.0;
         }
 
-        if self.tiling_mode == TilingMode::Depth {
+        if *rec_mode == TilingMode::Depth {
             self.viewport.target_x = 0.0;
             if immediate {
                 self.viewport.x = 0.0;
@@ -437,7 +513,7 @@ impl LayoutEngine {
         }
 
         // Horizontal camera target offset (centered on the active column)
-        let positions = self.column_positions(active_idx);
+        let positions = self.column_positions_for_mode(active_idx, rec_mode);
         let workspace = &self.workspaces[active_idx];
         
         if workspace.columns.is_empty() {
@@ -510,7 +586,7 @@ impl LayoutEngine {
     /// focused column. If no columns exist, it initializes the first column.
     pub fn spawn_window(&mut self, window_id: WindowId, title: String) {
         let win_width = self.default_width_fraction * (self.viewport.width - 2.0 * self.outer_margin - self.gap);
-        let window = Window { id: window_id, title };
+        let window = Window::new(window_id, title);
         let column = Column::new(window, win_width);
         
         // Track window ordering for Depth mode
@@ -759,7 +835,36 @@ impl LayoutEngine {
     }
 
     pub fn get_window_rect(&self, id: WindowId) -> Option<(f32, f32, f32, f32)> {
-        self.get_window_rect_for_mode(id, &self.tiling_mode)
+        if self.overview_open {
+            self.get_window_rect_for_mode(id, &TilingMode::Overview)
+        } else {
+            self.get_window_rect_for_mode(id, &self.tiling_mode)
+        }
+    }
+
+    pub fn project_rect(&self, x_local: f32, y_local: f32, w_local: f32, h_local: f32, ws_idx: usize, zoom: f32, is_overlay: bool) -> (f32, f32, f32, f32) {
+        let t = ((1.0 - zoom) / 0.55).clamp(0.0, 1.0);
+        let ws_w = self.viewport.width * zoom;
+        let ws_h = self.viewport.height * zoom;
+        let static_offset_x = (self.viewport.width - ws_w) / 2.0;
+        let static_offset_y = (self.viewport.height - ws_h) / 2.0;
+        let gap = 40.0 * t;
+        let ws_h_with_gap = ws_h + gap;
+        
+        let ws_x = static_offset_x;
+        let scroll_idx = self.viewport.y / self.viewport.height;
+        let ws_y = static_offset_y + (ws_idx as f32 - scroll_idx) * ws_h_with_gap;
+        
+        let x_screen = if is_overlay {
+            ws_x + x_local * zoom
+        } else {
+            ws_x + (x_local - self.viewport.x) * zoom
+        };
+        let y_screen = ws_y + y_local * zoom;
+        let w_screen = w_local * zoom;
+        let h_screen = h_local * zoom;
+        
+        (x_screen, y_screen, w_screen, h_screen)
     }
 
     pub fn get_window_rect_for_mode(&self, id: WindowId, mode: &TilingMode) -> Option<(f32, f32, f32, f32)> {
@@ -774,47 +879,25 @@ impl LayoutEngine {
                     let h = 400.0f32.min(self.viewport.height - 40.0);
                     let x = (self.viewport.width - w) / 2.0;
 
-                    let y = if *mode == TilingMode::Overview {
-                        let scale = 0.45_f32;
-                        let spacing = 40.0_f32;
-                        (ws_idx as f32 * (self.viewport.height + spacing / scale)) + (self.viewport.height - h) / 2.0
+                    if *mode == TilingMode::Overview {
+                        let y_local = (self.viewport.height - h) / 2.0;
+                        let (px, py, pw, ph) = self.project_rect(x, y_local, w, h, ws_idx, 0.45, true);
+                        return Some((px, py, pw, ph));
                     } else {
                         let ws_y = ws_idx as f32 * self.viewport.height;
-                        ws_y + (self.viewport.height - h) / 2.0
-                    };
-                    return Some((x, y, w, h));
+                        let y = ws_y + (self.viewport.height - h) / 2.0;
+                        return Some((x, y, w, h));
+                    }
                 }
 
                 if *mode == TilingMode::Overview {
-                    let scale = 0.45_f32;
-                    let spacing = 40.0_f32;
-                    
-                    let tiled_count = ws.columns.iter().filter(|c| !c.is_overlay()).count();
-                    let (base_x, base_y, base_w, base_h) = if tiled_count == 1 {
-                        (
-                            self.outer_margin,
-                            self.outer_margin,
-                            self.viewport.width - 2.0 * self.outer_margin,
-                            self.viewport.height - 2.0 * self.outer_margin,
-                        )
-                    } else {
-                        let positions = self.column_positions_for_mode(ws_idx, mode);
-                        let col_x = positions[col_idx];
-                        let col = &ws.columns[col_idx];
-                        let col_width = col.width;
-                        (
-                            col_x,
-                            self.outer_margin,
-                            col_width,
-                            self.viewport.height - 2.0 * self.outer_margin,
-                        )
-                    };
-                    
-                    let x = base_x;
-                    let y = (ws_idx as f32 * (self.viewport.height + spacing / scale)) + base_y;
-                    let w = base_w;
-                    let h = base_h;
-                    return Some((x, y, w, h));
+                    if let Some((nx, ny, nw, nh)) = self.get_window_rect_for_mode(id, &self.underlying_tiling_mode) {
+                        let ws_y = ws_idx as f32 * self.viewport.height;
+                        let x_local = nx;
+                        let y_local = ny - ws_y;
+                        let (px, py, pw, ph) = self.project_rect(x_local, y_local, nw, nh, ws_idx, 0.45, false);
+                        return Some((px, py, pw, ph));
+                    }
                 }
 
                 if *mode == TilingMode::Depth {
@@ -828,6 +911,15 @@ impl LayoutEngine {
 
                 let ws_y = ws_idx as f32 * self.viewport.height;
 
+                let col = &ws.columns[col_idx];
+                if col.is_tabbed() {
+                    let x = self.outer_margin;
+                    let y = ws_y + self.outer_margin;
+                    let w = self.viewport.width - 2.0 * self.outer_margin;
+                    let h = self.viewport.height - 2.0 * self.outer_margin;
+                    return Some((x, y, w, h));
+                }
+
                 let tiled_count = ws.columns.iter().filter(|c| !c.is_overlay()).count();
                 if tiled_count == 1 {
                     let x = self.outer_margin;
@@ -839,7 +931,6 @@ impl LayoutEngine {
 
                 let positions = self.column_positions_for_mode(ws_idx, mode);
                 let col_x = positions[col_idx];
-                let col = &ws.columns[col_idx];
                 let col_width = col.width;
                 
                 let x = col_x;
@@ -850,6 +941,40 @@ impl LayoutEngine {
             }
         }
         None
+    }
+
+    pub fn get_window_anim_or_target(&self, id: WindowId) -> Option<(f32, f32, f32, f32)> {
+        for ws in &self.workspaces {
+            if let Some((col_idx, _)) = ws.find_window(id) {
+                let col = &ws.columns[col_idx];
+                for win in &col.windows {
+                    if win.id == id {
+                        if win.anim_initialized {
+                            return Some((win.anim_x, win.anim_y, win.anim_w, win.anim_h));
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        self.get_window_rect(id)
+    }
+
+    pub fn get_window_anim_or_target_for_mode(&self, id: WindowId, mode: &TilingMode) -> Option<(f32, f32, f32, f32)> {
+        for ws in &self.workspaces {
+            if let Some((col_idx, _)) = ws.find_window(id) {
+                let col = &ws.columns[col_idx];
+                for win in &col.windows {
+                    if win.id == id {
+                        if win.anim_initialized {
+                            return Some((win.anim_x, win.anim_y, win.anim_w, win.anim_h));
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        self.get_window_rect_for_mode(id, mode)
     }
 }
 
@@ -1122,7 +1247,9 @@ mod tests {
     #[test]
     fn test_overview_mode() {
         let mut engine = LayoutEngine::new(1000.0, 600.0, 10.0, 20.0, 5);
-        engine.tiling_mode = TilingMode::Overview;
+        engine.overview_open = true;
+        engine.overview_progress = Some(OverviewProgress::Open);
+        engine.current_overview_scale = 0.45;
 
         let w1 = WindowId(1);
         let w2 = WindowId(2);
@@ -1138,36 +1265,77 @@ mod tests {
         engine.spawn_window(w2, "W2".to_string());
         engine.spawn_window(w3, "W3".to_string());
 
-        // Verify window 1 rect (workspace 0) - should be fullscreen
+        // Verify window 1 rect (workspace 0) - should be fullscreen in layout and projected for Overview
         let rect1 = engine.get_window_rect(w1).unwrap();
-        assert!((rect1.0 - 20.0).abs() < 1e-5);
-        assert!((rect1.1 - 20.0).abs() < 1e-5);
-        assert!((rect1.2 - 960.0).abs() < 1e-5);
-        assert!((rect1.3 - 560.0).abs() < 1e-5);
+        assert!((rect1.0 - 284.0).abs() < 1e-5);
+        assert!((rect1.1 - 174.0).abs() < 1e-5);
+        assert!((rect1.2 - 432.0).abs() < 1e-5);
+        assert!((rect1.3 - 252.0).abs() < 1e-5);
 
         // Verify window 2 rect (workspace 1) - should be full size next
         let rect2 = engine.get_window_rect(w2).unwrap();
-        assert!((rect2.0 - 20.0).abs() < 1e-5);
-        assert!((rect2.1 - 708.88889).abs() < 1e-5);
-        assert!((rect2.2 - 950.0).abs() < 1e-5);
-        assert!((rect2.3 - 560.0).abs() < 1e-5);
+        assert!((rect2.0 - 284.0).abs() < 1e-5);
+        assert!((rect2.1 - 484.0).abs() < 1e-5);
+        assert!((rect2.2 - 427.5).abs() < 1e-5);
+        assert!((rect2.3 - 252.0).abs() < 1e-5);
 
         // Verify window 3 rect (workspace 1) - should be full size next
         let rect3 = engine.get_window_rect(w3).unwrap();
-        assert!((rect3.0 - 980.0).abs() < 1e-5);
-        assert!((rect3.1 - 708.88889).abs() < 1e-5);
-        assert!((rect3.2 - 950.0).abs() < 1e-5);
-        assert!((rect3.3 - 560.0).abs() < 1e-5);
+        assert!((rect3.0 - 716.0).abs() < 1e-5);
+        assert!((rect3.1 - 484.0).abs() < 1e-5);
+        assert!((rect3.2 - 427.5).abs() < 1e-5);
+        assert!((rect3.3 - 252.0).abs() < 1e-5);
 
         // Verify camera recentering for active workspace 1
         engine.recenter_camera(true);
-        assert!((engine.viewport.target_y - 145.0).abs() < 1e-5);
-        assert!((engine.viewport.target_x - 154.75).abs() < 1e-5);
+        assert!((engine.viewport.target_y - 600.0).abs() < 1e-5);
+        assert!((engine.viewport.target_x - 955.0).abs() < 1e-5);
 
         // Verify camera recentering for active workspace 0
         engine.active_workspace_idx = 0;
         engine.recenter_camera(true);
-        assert!((engine.viewport.target_y - (-165.0)).abs() < 1e-5);
-        assert!((engine.viewport.target_x - (-275.0)).abs() < 1e-5);
+        assert!((engine.viewport.target_y - 0.0).abs() < 1e-5);
+        assert!((engine.viewport.target_x - 0.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_diagonal_mode_positions() {
+        let mut engine = LayoutEngine::new(1000.0, 600.0, 10.0, 20.0, 5);
+        engine.tiling_mode = TilingMode::Diagonal;
+
+        let w1 = WindowId(1);
+        let w2 = WindowId(2);
+
+        // Columns width = 500.0
+        engine.spawn_window(w1, "W1".to_string());
+        engine.spawn_window(w2, "W2".to_string());
+
+        let positions = engine.column_positions(0);
+        // Column 0: current_x + 0 * gap = 20.0 + 0 = 20.0
+        // Next current_x = 20.0 + 950.0 + 10.0 = 980.0
+        // Column 1: current_x + 1 * gap = 980.0 + 10.0 = 990.0
+        assert_eq!(positions[0], 20.0);
+        assert_eq!(positions[1], 990.0);
+    }
+
+    #[test]
+    fn test_float_mode_positions() {
+        let mut engine = LayoutEngine::new(1000.0, 600.0, 10.0, 20.0, 5);
+        engine.tiling_mode = TilingMode::Float;
+
+        let w1 = WindowId(1);
+        let w2 = WindowId(2);
+
+        engine.spawn_window(w1, "W1".to_string());
+        engine.spawn_window(w2, "W2".to_string());
+
+        // For float mode, columns width is customized. Let's set manually.
+        engine.active_workspace_mut().columns[0].width = 150.0;
+        engine.active_workspace_mut().columns[1].width = 320.0;
+
+        let positions = engine.column_positions(0);
+        // Retains manual width positions directly as stored positions.
+        assert_eq!(positions[0], 150.0);
+        assert_eq!(positions[1], 320.0);
     }
 }

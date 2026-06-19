@@ -94,6 +94,7 @@ def main():
         
         # Test 4: hier-multiview CLI --get-camera
         print("[*] Testing hier-multiview --get-camera...")
+        time.sleep(1.5)
         mv_res = subprocess.check_output(["./hier-multiview", "-d", display_name, "-c"]).decode()
         print(f"[Test 4] hier-multiview -c output:\n{mv_res}")
         assert "Current Position: (0.0, 0.0)" in mv_res, "Expected X and Y to snap/recenter to 0.0 in Depth mode"

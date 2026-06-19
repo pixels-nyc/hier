@@ -34,27 +34,71 @@ impl Spring {
             return (current, velocity);
         }
 
-        let mut curr_pos = current;
-        let mut curr_vel = velocity;
+        let x0 = current - target;
+        let v0 = velocity;
 
-        // Substep duration (1 ms) to ensure numerical integration doesn't explode.
-        const SUBSTEP: f32 = 0.001;
-        let mut remaining_time = dt;
+        // Stiffness k, Damping c
+        // Damping ratio zeta = c / (2 * sqrt(k))
+        // Undamped angular frequency omega_0 = sqrt(k)
+        let k = self.stiffness;
+        let c = self.damping;
 
-        while remaining_time > 0.0 {
-            let step = remaining_time.min(SUBSTEP);
-
-            // Hooke's Law: F = -k * dx
-            // Damping force: F_d = -c * v
-            // Total acceleration (assuming mass m = 1.0): a = -k * (x - target) - c * v
-            let acceleration = -self.stiffness * (curr_pos - target) - self.damping * curr_vel;
-
-            // Semi-implicit Euler integration
-            curr_vel += acceleration * step;
-            curr_pos += curr_vel * step;
-
-            remaining_time -= step;
+        if k <= 0.0 {
+            // Unbound / unstable system, just basic linear drift or snap to target
+            return (target, 0.0);
         }
+
+        let omega_0 = k.sqrt();
+        let zeta = c / (2.0 * omega_0);
+
+        let (curr_pos, curr_vel) = if zeta < 0.9999 {
+            // Underdamped
+            let omega_d = omega_0 * (1.0 - zeta * zeta).sqrt();
+            let exp = (-zeta * omega_0 * dt).exp();
+            let cos_val = (omega_d * dt).cos();
+            let sin_val = (omega_d * dt).sin();
+
+            // x(t) = exp * (x0 * cos + B * sin)
+            // where B = (v0 + zeta * omega_0 * x0) / omega_d
+            let b = (v0 + zeta * omega_0 * x0) / omega_d;
+            let x_t = exp * (x0 * cos_val + b * sin_val);
+
+            // v(t) = exp * (v0 * cos - ((omega_0^2 * x0 + zeta * omega_0 * v0) / omega_d) * sin)
+            let v_coeff = (omega_0 * omega_0 * x0 + zeta * omega_0 * v0) / omega_d;
+            let v_t = exp * (v0 * cos_val - v_coeff * sin_val);
+
+            (x_t + target, v_t)
+        } else if zeta > 1.0001 {
+            // Overdamped
+            let beta = omega_0 * (zeta * zeta - 1.0).sqrt();
+            let r1 = -zeta * omega_0 + beta;
+            let r2 = -zeta * omega_0 - beta;
+
+            let exp1 = (r1 * dt).exp();
+            let exp2 = (r2 * dt).exp();
+
+            // A = (v0 - r2 * x0) / (2 * beta)
+            // B = (-v0 + (beta - zeta * omega_0) * x0) / (2 * beta)
+            let div = 2.0 * beta;
+            let a = (v0 - r2 * x0) / div;
+            let b = (-v0 + (beta - zeta * omega_0) * x0) / div;
+
+            let x_t = a * exp1 + b * exp2;
+            let v_t = a * r1 * exp1 + b * r2 * exp2;
+
+            (x_t + target, v_t)
+        } else {
+            // Critically damped (zeta approx 1.0)
+            let exp = (-omega_0 * dt).exp();
+            let b = v0 + omega_0 * x0;
+
+            // x(t) = exp * (x0 + B * t)
+            let x_t = exp * (x0 + b * dt);
+            // v(t) = exp * (v0 - omega_0 * B * t)
+            let v_t = exp * (v0 - omega_0 * b * dt);
+
+            (x_t + target, v_t)
+        };
 
         // Snap to target if we're extremely close and moving very slowly
         if (curr_pos - target).abs() < 1e-3 && curr_vel.abs() < 1e-3 {

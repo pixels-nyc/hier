@@ -7,25 +7,132 @@ import os
 import subprocess
 import re
 import time
+import json
 
 def print_help():
-    print("Usage: hier-nest <nest_level> <command...>")
+    print("Usage: hier-nest <nest_level> [--cookie <id>] [--net <mode>] <command...>")
     print("Example: hier-nest 1 foot")
-    print("Example: hier-nest 1 alacritty")
-    print("Example: hier-nest 2 --software xterm")
+    print("Example: hier-nest 1 --cookie work foot")
+    print("Example: hier-nest 1 --net none foot")
     sys.exit(1)
 
 def main():
-    if len(sys.argv) < 3:
+    if len(sys.argv) < 2:
+        print_help()
+
+    # Parse internal flag indicating we are already in the bubblewrap sandbox
+    inside_sandbox = False
+    args = sys.argv[1:]
+    if args and args[0] == "--inside-sandbox":
+        inside_sandbox = True
+        args = args[1:]
+
+    if len(args) < 2:
         print_help()
 
     try:
-        nest_level = int(sys.argv[1])
+        nest_level = int(args[0])
     except ValueError:
         print("Error: nest_level must be an integer.")
         print_help()
 
-    command_args = sys.argv[2:]
+    # Parse optional arguments
+    cookie_id = None
+    net_mode = None
+    net_param = None
+    remaining_args = args[1:]
+    
+    idx = 0
+    while idx < len(remaining_args):
+        if remaining_args[idx] == "--cookie":
+            if idx + 1 < len(remaining_args):
+                cookie_id = remaining_args[idx+1]
+                idx += 2
+            else:
+                print("Error: --cookie requires a value.")
+                print_help()
+        elif remaining_args[idx] == "--net":
+            if idx + 1 < len(remaining_args):
+                net_mode = remaining_args[idx+1]
+                if net_mode in ("vpn", "proxy"):
+                    if idx + 2 < len(remaining_args):
+                        net_param = remaining_args[idx+2]
+                        idx += 3
+                    else:
+                        print(f"Error: --net {net_mode} requires a parameter.")
+                        print_help()
+                else:
+                    net_param = None
+                    idx += 2
+            else:
+                print("Error: --net requires a value.")
+                print_help()
+        else:
+            break
+
+    command_args = remaining_args[idx:]
+    if not command_args:
+        print("Error: No command specified to run inside the nest.")
+        print_help()
+
+    # Resolve paths
+    exe_dir = os.path.dirname(os.path.realpath(__file__))
+    sandbox_script = os.path.join(exe_dir, "sandbox_run.sh")
+
+    # If we are not inside the sandbox yet, wrap the entire execution in sandbox_run.sh
+    if not inside_sandbox and os.path.exists(sandbox_script):
+        sandbox_cmd = [sandbox_script]
+        if cookie_id:
+            sandbox_cmd += ["--cookie", cookie_id]
+        if net_mode:
+            sandbox_cmd += ["--net", net_mode]
+            if net_param:
+                sandbox_cmd += [net_param]
+            
+        nested_run_args = [sys.executable, "/app/hier-nest", "--inside-sandbox", str(nest_level)]
+        if cookie_id:
+            nested_run_args += ["--cookie", cookie_id]
+        if net_mode:
+            nested_run_args += ["--net", net_mode]
+            if net_param:
+                nested_run_args += [net_param]
+        nested_run_args += command_args
+        
+        full_cmd = sandbox_cmd + nested_run_args
+        print(f"[*] Re-executing hier-nest inside Bubblewrap sandbox:")
+        print(f"    {' '.join(full_cmd)}")
+        
+        # Detect host active output transform before sandboxing
+        host_transform = "Normal"
+        try:
+            res_ws = subprocess.check_output(["niri", "msg", "--json", "workspaces"]).decode()
+            workspaces = json.loads(res_ws)
+            active_output = None
+            for ws in workspaces:
+                if ws.get("is_focused") or ws.get("is_active"):
+                    active_output = ws.get("output")
+                    if ws.get("is_focused"):
+                        break
+            if active_output:
+                res_outs = subprocess.check_output(["niri", "msg", "--json", "outputs"]).decode()
+                outputs = json.loads(res_outs)
+                output_info = outputs.get(active_output)
+                if output_info:
+                    host_transform = output_info["logical"].get("transform", "Normal")
+        except Exception:
+            pass
+
+        env = os.environ.copy()
+        env["HIER_HOST_TRANSFORM"] = host_transform
+        if cookie_id:
+            env["HIER_COOKIE"] = cookie_id
+            
+        try:
+            res = subprocess.run(full_cmd, env=env)
+            sys.exit(res.returncode)
+        except Exception as e:
+            print(f"❌ Error re-executing inside sandbox: {e}")
+            sys.exit(1)
 
     # Resolve parent display.
     # Use the active WAYLAND_DISPLAY environment variable if present.
@@ -38,9 +145,10 @@ def main():
     # Build environment for the child compositor
     comp_env = os.environ.copy()
     comp_env["WAYLAND_DISPLAY"] = parent_display
+    if cookie_id:
+        comp_env["HIER_COOKIE"] = cookie_id
 
     # Path to the compositor binary
-    exe_dir = os.path.dirname(os.path.realpath(__file__))
     comp_bin = os.path.join(exe_dir, "target/debug/hier")
     if not os.path.exists(comp_bin):
         comp_bin = "hier"  # Fallback to system path
@@ -95,15 +203,11 @@ def main():
     # Setup environment for the client
     client_env = os.environ.copy()
     client_env["WAYLAND_DISPLAY"] = child_display
+    if cookie_id:
+        client_env["HIER_COOKIE"] = cookie_id
 
-    # We run the command via the sandbox script for maximum security nesting
-    sandbox_script = os.path.join(exe_dir, "sandbox_run.sh")
-    if os.path.exists(sandbox_script):
-        # Pass the arguments to sandbox_run.sh
-        client_cmd = [sandbox_script] + command_args
-        print(f"[*] Wrapping client in sandbox container: {sandbox_script}")
-    else:
-        client_cmd = command_args
+    # Since we are already inside the sandbox container, we execute the client directly.
+    client_cmd = command_args
 
     try:
         client_proc = subprocess.Popen(
@@ -129,3 +233,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
