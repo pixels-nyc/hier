@@ -2700,25 +2700,19 @@ fn find_terminal_cmd() -> String {
                 if let Some(win_id) = target_win_id {
                     let mut found = None;
                     for (_ws_idx, ws) in self.layout_engine.workspaces.iter().enumerate() {
-                        for (col_idx, col) in ws.columns.iter().enumerate() {
-                            for (win_idx, win) in col.windows.iter().enumerate() {
-                                if win.id == win_id {
-                                    let win_z = if self.layout_engine.tiling_mode == crate::layout::TilingMode::Depth {
-                                        if let Some(i) = self.layout_engine.windows.iter().position(|&w_id| w_id == win.id) {
-                                            (i as f32) - self.layout_engine.depth_scroll_progress
-                                        } else {
-                                            0.0f32
-                                        }
-                                    } else {
-                                        0.0f32
-                                    };
-                                    found = Some(format!("Scrolling Position: column({}) ; tile){} ; z axis({})\n", col_idx, win_idx, win_z));
-                                    break;
+                        if let Some((col_idx, win_idx)) = ws.find_window(win_id) {
+                            let win_z = if self.layout_engine.tiling_mode == crate::layout::TilingMode::Depth {
+                                if let Some(i) = self.layout_engine.windows.iter().position(|&w_id| w_id == win_id) {
+                                    (i as f32) - self.layout_engine.depth_scroll_progress
+                                } else {
+                                    0.0f32
                                 }
-                            }
-                            if found.is_some() { break; }
+                            } else {
+                                0.0f32
+                            };
+                            found = Some(format!("Scrolling Position: column({}) ; tile){} ; z axis({})\n", col_idx, win_idx, win_z));
+                            break;
                         }
-                        if found.is_some() { break; }
                     }
                     found.unwrap_or_else(|| "error: window not found\n".to_string())
                 } else {
